@@ -221,7 +221,7 @@ async def segment_image(request: SegmentRequest):
 
         # Run inference
         with torch.no_grad():
-            outputs = model(**inputs)
+            outputs = model(**inputs, multimask_output=request.multimask_output)
 
         # Post-process masks
         masks = processor.post_process_masks(
