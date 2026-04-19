@@ -69,14 +69,15 @@ pip install -e '.[p3d]'
 echo "--- 5. Installing Inference deps (manual, bypassing sam3d cu121 pins) ---"
 # Install requirements.inference.txt manually to avoid sam3d-objects resolving torchaudio==2.5.1+cu121
 pip install seaborn==0.13.2 gradio==5.49.0
-pip install gsplat @ git+https://github.com/nerfstudio-project/gsplat.git@2323de5905d5e90e035f792fe65bad0fedd413e7
+pip install "gsplat @ git+https://github.com/nerfstudio-project/gsplat.git@2323de5905d5e90e035f792fe65bad0fedd413e7"
 pip install kaolin==0.18.0 \
     -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.7.0_cu128.html
 
 echo "--- 5b. cu128 overrides ---"
 pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
     --index-url https://download.pytorch.org/whl/cu128
-pip install spconv-cu128==2.3.8
+# spconv has no cu128 package — cu121 build runs on cu128 at runtime
+pip install spconv-cu121==2.3.8 --extra-index-url https://download.pytorch.org/whl/cu121
 pip install xformers --index-url https://download.pytorch.org/whl/cu128
 
 if [ -f "./patching/hydra" ]; then
@@ -112,6 +113,11 @@ if [ -f "requirements.txt" ]; then
 else
     echo "No requirements.txt found in $(pwd)."
 fi
+
+echo "--- 8. Final cu128 pin (must run last to override any cu121 reinstalls) ---"
+pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
+    --index-url https://download.pytorch.org/whl/cu128
+pip install xformers --index-url https://download.pytorch.org/whl/cu128
 
 echo "--- Setup Complete! ---"
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
