@@ -65,17 +65,18 @@ export PIP_EXTRA_INDEX_URL="https://pypi.ngc.nvidia.com https://download.pytorch
 pip install -e '.[dev]'
 pip install -e '.[p3d]'
 
-echo "--- 5. Installing Inference & Patching ---"
-export PIP_FIND_LINKS="https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.7.0_cu128.html"
-pip install -e '.[inference]' --no-deps
+echo "--- 5. Installing Inference deps (manual, bypassing sam3d cu121 pins) ---"
+# Install requirements.inference.txt manually to avoid sam3d-objects resolving torchaudio==2.5.1+cu121
+pip install seaborn==0.13.2 gradio==5.49.0
+pip install gsplat @ git+https://github.com/nerfstudio-project/gsplat.git@2323de5905d5e90e035f792fe65bad0fedd413e7
+pip install kaolin==0.18.0 \
+    -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.7.0_cu128.html
 
-echo "--- 5b. Overriding sam3d-objects deps for cu128/torch-2.7.0 ---"
+echo "--- 5b. cu128 overrides ---"
 pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
     --index-url https://download.pytorch.org/whl/cu128
 pip install spconv-cu128==2.3.8
 pip install xformers --index-url https://download.pytorch.org/whl/cu128
-pip install --force-reinstall --no-deps kaolin==0.18.0 \
-    -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.7.0_cu128.html
 
 if [ -f "./patching/hydra" ]; then
     chmod +x ./patching/hydra
