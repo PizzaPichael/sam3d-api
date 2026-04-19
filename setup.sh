@@ -60,7 +60,13 @@ pip install -e '.[p3d]'
 
 echo "--- 5. Installing Inference & Patching ---"
 export PIP_FIND_LINKS="https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.7.0_cu128.html"
-pip install -e '.[inference]'
+pip install -e '.[inference]' --no-deps
+
+echo "--- 5b. Overriding sam3d-objects deps for cu128/torch-2.7.0 ---"
+pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
+    --index-url https://download.pytorch.org/whl/cu128
+pip install spconv-cu128==2.3.8
+pip install xformers --index-url https://download.pytorch.org/whl/cu128
 pip install --force-reinstall --no-deps kaolin==0.18.0 \
     -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.7.0_cu128.html
 
