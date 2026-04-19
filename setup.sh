@@ -39,16 +39,23 @@ fi
 source "$CONDA_ROOT/etc/profile.d/conda.sh"
 conda init bash
 
+# Route all installs to network storage
+export CONDA_ENVS_PATH=/workspace/envs
+export CONDA_PKGS_DIRS=/workspace/conda-pkgs
+export PIP_CACHE_DIR=/workspace/pip-cache
+export TMPDIR=/workspace/tmp
+mkdir -p /workspace/conda-pkgs /workspace/pip-cache /workspace/tmp
+
 echo "--- 3. Setting up Conda Environment ---"
-ENV_NAME="sam3d-objects"
-if conda info --envs | grep -q "$ENV_NAME"; then
-    echo "Environment '$ENV_NAME' exists. Updating..."
-    conda env update -f environments/default.yml --prune
+ENV_PATH="/workspace/envs/sam3d-objects"
+if [ -d "$ENV_PATH" ]; then
+    echo "Environment '$ENV_PATH' exists. Updating..."
+    conda env update -p "$ENV_PATH" -f environments/default.yml --prune
 else
-    conda env create -f environments/default.yml
+    conda env create -p "$ENV_PATH" -f environments/default.yml
 fi
 
-conda activate "$ENV_NAME"
+conda activate "$ENV_PATH"
 
 echo "--- 4. Installing PyTorch 2.7.0 (Blackwell/cu128) ---"
 pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
