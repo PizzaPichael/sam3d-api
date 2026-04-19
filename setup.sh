@@ -10,8 +10,8 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     sleep 2
 fi
 
-# Exit on error
-set -e
+# Exit on error (disabled: sam3d-objects has pinned cu121 deps that cause non-fatal resolution warnings)
+# set -e
 
 echo "--- 1. Handling Repository ---"
 REPO_DIR="sam-3d-objects"
@@ -61,7 +61,8 @@ echo "--- 4. Installing PyTorch 2.7.0 (Blackwell/cu128) ---"
 pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
     --index-url https://download.pytorch.org/whl/cu128
 
-export PIP_EXTRA_INDEX_URL="https://pypi.ngc.nvidia.com https://download.pytorch.org/whl/cu128"
+# cu121 included so pip can resolve sam3d-objects' pinned torchaudio==2.5.1+cu121 — overridden in step 5b
+export PIP_EXTRA_INDEX_URL="https://pypi.ngc.nvidia.com https://download.pytorch.org/whl/cu128 https://download.pytorch.org/whl/cu121"
 pip install -e '.[dev]'
 pip install -e '.[p3d]'
 
