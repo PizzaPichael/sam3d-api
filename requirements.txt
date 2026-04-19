@@ -1,11 +1,9 @@
 fastapi
 uvicorn[standard]
 pydantic
-torch
-torchvision
 pillow
 numpy
-transformers==4.57.3
+transformers==4.45.0
 opencv-python
 scipy
 trimesh
