@@ -60,7 +60,8 @@ from pydantic import BaseModel
 import uvicorn
 
 # SAM 2 imports from transformers
-from transformers import Sam2Processor, Sam2Model
+from transformers import AutoProcessor, Sam2Model
+Sam2Processor = AutoProcessor  # Sam2Processor not exported directly in all versions
 
 # ============================================================================
 # PYTORCH CONFIGURATION FOR SPCONV COMPATIBILITY
