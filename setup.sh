@@ -115,9 +115,11 @@ else
 fi
 
 echo "--- 8. Final cu128 pin (must run last to override any cu121 reinstalls) ---"
-pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
-    --index-url https://download.pytorch.org/whl/cu128
 pip install xformers --index-url https://download.pytorch.org/whl/cu128
+pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
+    --index-url https://download.pytorch.org/whl/cu128 --force-reinstall --no-deps
+pip install kaolin==0.18.0 \
+    -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.7.0_cu128.html --force-reinstall --no-deps
 
 echo "--- Setup Complete! ---"
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
