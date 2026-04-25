@@ -57,6 +57,10 @@ fi
 
 conda activate "$ENV_PATH"
 
+# Use system CUDA 12.8 for all native builds — conda env nvcc is 12.1 and doesn't support sm_120
+export CUDA_HOME=/usr/local/cuda-12.8
+export PATH=$CUDA_HOME/bin:$PATH
+
 echo "--- 4. Installing PyTorch 2.7.0 (Blackwell/cu128) ---"
 pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
     --index-url https://download.pytorch.org/whl/cu128
@@ -107,8 +111,8 @@ echo "--- 7. Final Requirements (Root) ---"
 cd ..
 if [ -f "requirements.txt" ]; then
     echo "Installing requirements.txt from $(pwd)..."
-
     pip install -r requirements.txt
+    pip install hf_transfer
     pip install git+https://github.com/NVlabs/nvdiffrast.git --no-build-isolation
 else
     echo "No requirements.txt found in $(pwd)."
@@ -120,6 +124,10 @@ pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128
     --index-url https://download.pytorch.org/whl/cu128 --force-reinstall --no-deps
 pip install kaolin==0.18.0 \
     -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.7.0_cu128.html --force-reinstall --no-deps
+
+echo "--- 9. Building pytorch3d for Blackwell (sm_120) ---"
+# Must use system CUDA 12.8 nvcc — conda env nvcc is 12.1 and doesn't support sm_120
+TORCH_CUDA_ARCH_LIST="12.0" pip install "git+https://github.com/facebookresearch/pytorch3d.git" --no-build-isolation
 
 echo "--- Setup Complete! ---"
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
