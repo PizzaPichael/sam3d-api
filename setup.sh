@@ -139,6 +139,12 @@ TORCH_CUDA_ARCH_LIST="12.0" pip install "git+https://github.com/facebookresearch
 TORCH_CUDA_ARCH_LIST="12.0" pip install "gsplat @ git+https://github.com/nerfstudio-project/gsplat.git@2323de5905d5e90e035f792fe65bad0fedd413e7" --force-reinstall
 TORCH_CUDA_ARCH_LIST="12.0" pip install git+https://github.com/NVlabs/nvdiffrast.git --no-build-isolation --force-reinstall
 
+echo "--- 10. Absolute final version pins (overrides anything Step 9 may have pulled) ---"
+pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
+    --index-url https://download.pytorch.org/whl/cu128 --force-reinstall --no-deps
+pip install numpy==1.26.4 --force-reinstall --no-deps
+pip install nvidia-cusparselt-cu12==0.6.3 --force-reinstall --no-deps
+
 echo "--- Setup Complete! ---"
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
     echo "SUCCESS: You are now active in the '$ENV_NAME' environment."
