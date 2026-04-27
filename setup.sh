@@ -57,9 +57,16 @@ fi
 
 conda activate "$ENV_PATH"
 
-# Use system CUDA 12.8 for all native builds — conda env nvcc is 12.1 and doesn't support sm_120
-export CUDA_HOME=/usr/local/cuda-12.8
-export PATH=$CUDA_HOME/bin:$PATH
+# Use system CUDA for all native builds — conda env nvcc is too old and doesn't support sm_120
+# Pick the highest available CUDA version under /usr/local
+CUDA_HOME_CANDIDATE=$(find /usr/local -maxdepth 1 -name "cuda-1*" -type d | sort -V | tail -1)
+if [ -n "$CUDA_HOME_CANDIDATE" ] && [ -f "$CUDA_HOME_CANDIDATE/bin/nvcc" ]; then
+    export CUDA_HOME="$CUDA_HOME_CANDIDATE"
+    export PATH=$CUDA_HOME/bin:$PATH
+    echo "Using system CUDA: $CUDA_HOME ($(nvcc --version | grep release))"
+else
+    echo "WARNING: No system nvcc found — native builds may fail for sm_120"
+fi
 
 echo "--- 4. Installing PyTorch 2.7.0 (Blackwell/cu128) ---"
 pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
@@ -82,7 +89,7 @@ pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128
     --index-url https://download.pytorch.org/whl/cu128
 # spconv has no cu128 package — cu121 build runs on cu128 at runtime
 pip install spconv-cu121==2.3.8 --extra-index-url https://download.pytorch.org/whl/cu121
-pip install xformers --index-url https://download.pytorch.org/whl/cu128
+pip install xformers --index-url https://download.pytorch.org/whl/cu128 --no-deps
 
 if [ -f "./patching/hydra" ]; then
     chmod +x ./patching/hydra
@@ -119,15 +126,18 @@ else
 fi
 
 echo "--- 8. Final cu128 pin (must run last to override any cu121 reinstalls) ---"
-pip install xformers --index-url https://download.pytorch.org/whl/cu128
+pip install xformers --index-url https://download.pytorch.org/whl/cu128 --force-reinstall --no-deps
 pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
     --index-url https://download.pytorch.org/whl/cu128 --force-reinstall --no-deps
 pip install kaolin==0.18.0 \
     -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.7.0_cu128.html --force-reinstall --no-deps
 
-echo "--- 9. Building pytorch3d for Blackwell (sm_120) ---"
+echo "--- 9. Rebuilding native extensions against final torch 2.7.0+cu128 ---"
+# These must be built AFTER the torch pin — they have CUDA kernels and are ABI-sensitive
 # Must use system CUDA 12.8 nvcc — conda env nvcc is 12.1 and doesn't support sm_120
 TORCH_CUDA_ARCH_LIST="12.0" pip install "git+https://github.com/facebookresearch/pytorch3d.git" --no-build-isolation
+TORCH_CUDA_ARCH_LIST="12.0" pip install "gsplat @ git+https://github.com/nerfstudio-project/gsplat.git@2323de5905d5e90e035f792fe65bad0fedd413e7" --force-reinstall
+TORCH_CUDA_ARCH_LIST="12.0" pip install git+https://github.com/NVlabs/nvdiffrast.git --no-build-isolation --force-reinstall
 
 echo "--- Setup Complete! ---"
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
