@@ -457,11 +457,11 @@ def main():
 
         # Try to pass device to Inference if it supports it
         try:
-            sam3d_inference = Inference(config_path, compile=True, device="cuda")
+            sam3d_inference = Inference(config_path, compile=False, device="cuda")
             print(f"[Subprocess] Inference initialized with device='cuda'")
         except TypeError:
             # If device parameter not supported, initialize normally
-            sam3d_inference = Inference(config_path, compile=True)
+            sam3d_inference = Inference(config_path, compile=False)
             print(
                 f"[Subprocess] Inference initialized (device parameter not supported)"
             )
