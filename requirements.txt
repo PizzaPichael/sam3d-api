@@ -8,4 +8,4 @@ opencv-python
 scipy
 trimesh
 pygltflib
-git+https://github.com/autonomousvision/mip-splatting.git#subdirectory=submodules/diff-gaussian-rasterization
+# diff-gaussian-rasterization is installed in setup.sh Step 9 with TORCH_CUDA_ARCH_LIST=12.0 (sm_120 / Blackwell)

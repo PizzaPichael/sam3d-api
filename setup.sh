@@ -137,11 +137,13 @@ echo "--- 9. Rebuilding native extensions against final torch 2.7.0+cu128 ---"
 # Must use system CUDA 12.8 nvcc — conda env nvcc is 12.1 and doesn't support sm_120
 TORCH_CUDA_ARCH_LIST="12.0" pip install "git+https://github.com/facebookresearch/pytorch3d.git" --no-build-isolation
 TORCH_CUDA_ARCH_LIST="12.0" pip install "gsplat @ git+https://github.com/nerfstudio-project/gsplat.git@2323de5905d5e90e035f792fe65bad0fedd413e7" --force-reinstall
-# Re-pin torch before nvdiffrast: pytorch3d/gsplat may have pulled a newer torch,
-# and nvdiffrast must be compiled against exactly 2.7.0 (ABI-sensitive)
+# Re-pin torch before remaining builds: pytorch3d/gsplat may have pulled a newer torch,
+# and ABI-sensitive packages must be compiled against exactly 2.7.0
 pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
     --index-url https://download.pytorch.org/whl/cu128 --force-reinstall --no-deps
 TORCH_CUDA_ARCH_LIST="12.0" pip install git+https://github.com/NVlabs/nvdiffrast.git --no-build-isolation --force-reinstall --no-deps
+# diff_gaussian_rasterization requires sm_120 — must be rebuilt here, not via requirements.txt
+TORCH_CUDA_ARCH_LIST="12.0" pip install "git+https://github.com/autonomousvision/mip-splatting.git#subdirectory=submodules/diff-gaussian-rasterization" --no-build-isolation --force-reinstall --no-deps
 
 echo "--- 10. Absolute final version pins (overrides anything Step 9 may have pulled) ---"
 pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
