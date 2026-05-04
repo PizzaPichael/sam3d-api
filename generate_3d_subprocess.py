@@ -509,6 +509,25 @@ def main():
             )
         print(f"[Subprocess] ✓ Pipeline object accessed for GLB export")
 
+        # Reduce inference steps for faster generation (default is 25)
+        INFERENCE_STEPS = 12
+        pipe.override_ss_generator_cfg_config(
+            pipe.models["ss_generator"],
+            inference_steps=INFERENCE_STEPS,
+            cfg_strength=7,
+            cfg_interval=[0, 500],
+            rescale_t=3,
+            cfg_strength_pm=0.0,
+        )
+        pipe.override_slat_generator_cfg_config(
+            pipe.models["slat_generator"],
+            inference_steps=INFERENCE_STEPS,
+            cfg_strength=1,
+            cfg_interval=[0, 500],
+            rescale_t=1,
+        )
+        print(f"[Subprocess] Inference steps set to {INFERENCE_STEPS} for both generators")
+
         # Load image and mask from files
         print(f"[Subprocess] Loading image from {image_path}")
         image_pil = Image.open(image_path).convert("RGB")
@@ -609,7 +628,8 @@ def main():
         print(f"[Subprocess] Using decode_formats: {decode_formats_with_mesh}")
 
         # Use pipeline.run() directly to enable GLB output with texture baking
-        with torch.no_grad():
+        # bfloat16 autocast: ~2x faster on A100/Blackwell, falls back to float32 on older GPUs
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
             output = pipe.run(
                 image=image,
                 mask=mask,
