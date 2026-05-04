@@ -134,16 +134,22 @@ pip install kaolin==0.18.0 \
 
 echo "--- 9. Rebuilding native extensions against final torch 2.7.0+cu128 ---"
 # These must be built AFTER the torch pin — they have CUDA kernels and are ABI-sensitive
-# Must use system CUDA 12.8 nvcc — conda env nvcc is 12.1 and doesn't support sm_120
-TORCH_CUDA_ARCH_LIST="12.0" pip install "git+https://github.com/facebookresearch/pytorch3d.git" --no-build-isolation
-TORCH_CUDA_ARCH_LIST="12.0" pip install "gsplat @ git+https://github.com/nerfstudio-project/gsplat.git@2323de5905d5e90e035f792fe65bad0fedd413e7" --force-reinstall
+# Must use system CUDA nvcc — conda env nvcc is too old and doesn't support newer architectures
+
+# Detect GPU compute capability so builds work on any GPU (Blackwell sm_120, A100 sm_80, etc.)
+GPU_ARCH=$(python -c "import torch; cap=torch.cuda.get_device_capability(); print(f'{cap[0]}.{cap[1]}')" 2>/dev/null || echo "8.0")
+echo "Detected GPU compute capability: sm_${GPU_ARCH/./} (TORCH_CUDA_ARCH_LIST=$GPU_ARCH)"
+
+TORCH_CUDA_ARCH_LIST="$GPU_ARCH" pip install "git+https://github.com/facebookresearch/pytorch3d.git" --no-build-isolation
+TORCH_CUDA_ARCH_LIST="$GPU_ARCH" pip install "gsplat @ git+https://github.com/nerfstudio-project/gsplat.git@2323de5905d5e90e035f792fe65bad0fedd413e7" --force-reinstall
 # Re-pin torch before remaining builds: pytorch3d/gsplat may have pulled a newer torch,
 # and ABI-sensitive packages must be compiled against exactly 2.7.0
 pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
     --index-url https://download.pytorch.org/whl/cu128 --force-reinstall --no-deps
-TORCH_CUDA_ARCH_LIST="12.0" pip install git+https://github.com/NVlabs/nvdiffrast.git --no-build-isolation --force-reinstall --no-deps
-# diff_gaussian_rasterization requires sm_120 — must be rebuilt here, not via requirements.txt
-TORCH_CUDA_ARCH_LIST="12.0" pip install "git+https://github.com/autonomousvision/mip-splatting.git#subdirectory=submodules/diff-gaussian-rasterization" --no-build-isolation --force-reinstall --no-deps
+TORCH_CUDA_ARCH_LIST="$GPU_ARCH" pip install git+https://github.com/NVlabs/nvdiffrast.git --no-build-isolation --force-reinstall --no-deps
+# diff_gaussian_rasterization and flash_attn are ABI-sensitive — must be rebuilt here
+TORCH_CUDA_ARCH_LIST="$GPU_ARCH" pip install "git+https://github.com/autonomousvision/mip-splatting.git#subdirectory=submodules/diff-gaussian-rasterization" --no-build-isolation --force-reinstall --no-deps
+TORCH_CUDA_ARCH_LIST="$GPU_ARCH" pip install flash-attn --no-build-isolation --force-reinstall --no-deps
 
 echo "--- 10. Absolute final version pins (overrides anything Step 9 may have pulled) ---"
 pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
