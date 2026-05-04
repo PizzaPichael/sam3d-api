@@ -628,8 +628,7 @@ def main():
         print(f"[Subprocess] Using decode_formats: {decode_formats_with_mesh}")
 
         # Use pipeline.run() directly to enable GLB output with texture baking
-        # bfloat16 autocast: ~2x faster on A100/Blackwell, falls back to float32 on older GPUs
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.no_grad():
             output = pipe.run(
                 image=image,
                 mask=mask,
