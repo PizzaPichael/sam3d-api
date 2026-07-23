@@ -23,9 +23,6 @@ fi
 # Exit on error (disabled: sam3d-objects has pinned cu121 deps that cause non-fatal resolution warnings)
 # set -e
 
-# Exit on error (disabled: sam3d-objects has pinned cu121 deps that cause non-fatal resolution warnings)
-# set -e
-
 echo "--- 1. Handling Repository ---"
 REPO_DIR="sam-3d-objects"
 if [ -d "$REPO_DIR" ]; then
@@ -116,28 +113,80 @@ else
     echo "WARNING: No system nvcc found — native builds may fail for sm_120"
 fi
 
+# Parallelize CUDA compiles (flash-attn in step 4, native rebuilds in step 9) via MAX_JOBS,
+# bounded by RAM: each nvcc unit peaks at several GB, so nproc jobs would OOM-kill the build.
+# IMPORTANT: /proc/meminfo reports HOST RAM inside a container — read the cgroup limit too
+# and take the minimum, or the budget is wildly over-estimated on RunPod.
+mem_host=$(awk '/MemTotal/ {print $2*1024}' /proc/meminfo)   # bytes
+mem_limit=$mem_host
+if [ -r /sys/fs/cgroup/memory.max ]; then                              # cgroup v2
+    v=$(cat /sys/fs/cgroup/memory.max)
+    [ "$v" != "max" ] && mem_limit=$v
+elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then          # cgroup v1
+    v=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
+    [ "$v" -lt "$mem_host" ] && mem_limit=$v
+fi
+RAM_GB=$(( mem_limit / 1024 / 1024 / 1024 ))
+BUFFER_PCT=20        # keep 20% of RAM free
+PER_JOB_GB=3         # conservative per-job RAM peak (flash-attn nvcc)
+usable=$(( RAM_GB * (100 - BUFFER_PCT) / 100 ))
+jobs_by_ram=$(( usable / PER_JOB_GB ))
+[ "$jobs_by_ram" -lt 1 ] && jobs_by_ram=1
+ncpu=$(nproc)
+export MAX_JOBS=$(( jobs_by_ram < ncpu ? jobs_by_ram : ncpu ))
+echo "Build parallelism: RAM ${RAM_GB}GB, ${BUFFER_PCT}% buffer, ~${PER_JOB_GB}GB/job -> MAX_JOBS=$MAX_JOBS (nproc=$ncpu)"
+
 echo "--- 4. Installing PyTorch 2.7.0 (Blackwell/cu128) ---"
 pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
     --index-url https://download.pytorch.org/whl/cu128
 
+# Detect GPU compute capability now (needs torch) — used by the pytorch3d pre-build below
+# and the native rebuilds in step 9. Works on any GPU (Blackwell sm_120, A100 sm_80, etc.).
+GPU_ARCH=$(python -c "import torch; cap=torch.cuda.get_device_capability(); print(f'{cap[0]}.{cap[1]}')" 2>/dev/null || echo "8.0")
+echo "Detected GPU compute capability: sm_${GPU_ARCH/./} (TORCH_CUDA_ARCH_LIST=$GPU_ARCH)"
+
 # cu121 included so pip can resolve sam3d-objects' pinned torchaudio==2.5.1+cu121 — overridden in step 5b
 export PIP_EXTRA_INDEX_URL="https://pypi.ngc.nvidia.com https://download.pytorch.org/whl/cu128 https://download.pytorch.org/whl/cu121"
 
-# auto-gptq is an sdist whose setup.py imports torch at build time. pip's build isolation
-# hides the torch installed above, so '.[dev]' below aborts with "No module named 'torch'"
-# and sam3d_objects never gets installed. Pre-install it here so pip sees it as satisfied.
-# BUILD_CUDA_EXT=0 skips the CUDA kernel build — GPTQ quantization is not used in the
-# mesh pipeline, only the import needs to resolve.
+# Installing sam3d-objects is a two-sided problem:
+#
+#   (a) sam3d-objects ITSELF builds with hatchling + a hatch-requirements-txt plugin. That
+#       build backend must come from pip's build ISOLATION — with --no-build-isolation it
+#       fails ("Cannot import 'hatchling.build'" / "Unknown metadata hook: requirements_txt").
+#       So the '.[dev]'/'.[p3d]' installs below keep build isolation ON.
+#
+#   (b) Four sdist DEPS import torch or pip at build time (auto-gptq, nvidia-pyindex,
+#       flash-attn, pytorch3d). Under isolation those abort with "No module named
+#       'torch'/'pip'". So we pre-install exactly those here (each needs --no-build-isolation
+#       to see the env's torch/pip). Once satisfied, the isolated '.[dev]' below does NOT
+#       rebuild them.
+#
+#   - auto-gptq: BUILD_CUDA_EXT=0 skips its CUDA kernel (GPTQ is unused in the mesh pipeline;
+#     only the import needs to resolve).
+#   - nvidia-pyindex: its setup.py shells out to `python -c 'import pip'`.
+#   - flash-attn==2.8.3: a prebuilt wheel exists for this exact env
+#     (cu12/torch2.7/cxx11abiTRUE/cp311), so this is a fast download, not a compile.
+#     (TMPDIR and PIP_CACHE_DIR are both on /workspace — same filesystem — so flash-attn's
+#     download-then-rename does not hit a cross-device EXDEV error.)
+#   - pytorch3d: sam3d-objects pins a specific commit; without pre-installing it, '.[dev]'
+#     rebuilds that commit under isolation and fails on "No module named 'torch'". It gets
+#     force-rebuilt against final torch in step 9 anyway, so this pre-build is only to let
+#     resolution pass. TORCH_CUDA_ARCH_LIST/CUDA_HOME are already set above.
 BUILD_CUDA_EXT=0 pip install auto-gptq==0.7.1 --no-build-isolation
+pip install nvidia-pyindex --no-build-isolation
+pip install flash-attn==2.8.3 --no-build-isolation
+TORCH_CUDA_ARCH_LIST="$GPU_ARCH" pip install \
+    "pytorch3d @ git+https://github.com/facebookresearch/pytorch3d.git@75ebeeaea0908c5527e7b1e305fbc7681382db47" \
+    --no-build-isolation --no-deps
 
+# Build isolation stays ON here so hatchling + hatch-requirements-txt are auto-provided.
 pip install -e '.[dev]'
 pip install -e '.[p3d]'
 
-# '.[dev]' silently continues on failure (set -e is off) — verify the package actually landed
-python -c "import sam3d_objects" 2>/dev/null || {
-    echo "WARNING: sam3d_objects not importable after '.[dev]' — retrying without build isolation"
-    pip install -e '.[dev]' --no-build-isolation
-}
+# set -e is off — verify the package actually landed instead of silently continuing
+python -c "import sam3d_objects" 2>/dev/null \
+    && echo "sam3d_objects import OK" \
+    || echo "WARNING: sam3d_objects still not importable — check the '.[dev]' output above"
 
 echo "--- 5. Installing Inference deps (manual, bypassing sam3d cu121 pins) ---"
 # Install requirements.inference.txt manually to avoid sam3d-objects resolving torchaudio==2.5.1+cu121
@@ -151,7 +200,11 @@ pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128
     --index-url https://download.pytorch.org/whl/cu128
 # spconv has no cu128 package — cu121 build runs on cu128 at runtime
 pip install spconv-cu121==2.3.8 --extra-index-url https://download.pytorch.org/whl/cu121
-pip install xformers --index-url https://download.pytorch.org/whl/cu128 --no-deps
+# Pin xformers to 0.0.30 — the release built against torch 2.7.0. Unpinned 'xformers'
+# grabs latest (built for torch 2.10/2.11): its C++/CUDA extensions then refuse to load
+# ("xFormers can't load C++/CUDA extensions"), which breaks moge/dinov2 SwiGLU and stops
+# sam3d-objects from starting (see setup-fixes.md point 4).
+pip install xformers==0.0.30 --index-url https://download.pytorch.org/whl/cu128 --no-deps
 
 if [ -f "./patching/hydra" ]; then
     chmod +x ./patching/hydra
@@ -195,7 +248,8 @@ else
 fi
 
 echo "--- 8. Final cu128 pin (must run last to override any cu121 reinstalls) ---"
-pip install xformers --index-url https://download.pytorch.org/whl/cu128 --force-reinstall --no-deps
+# xformers==0.0.30 matches torch 2.7.0 (see step 5b comment) — never unpinned here.
+pip install xformers==0.0.30 --index-url https://download.pytorch.org/whl/cu128 --force-reinstall --no-deps
 pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
     --index-url https://download.pytorch.org/whl/cu128 --force-reinstall --no-deps
 pip install kaolin==0.18.0 \
@@ -204,35 +258,25 @@ pip install kaolin==0.18.0 \
 echo "--- 9. Rebuilding native extensions against final torch 2.7.0+cu128 ---"
 # These must be built AFTER the torch pin — they have CUDA kernels and are ABI-sensitive
 # Must use system CUDA nvcc — conda env nvcc is too old and doesn't support newer architectures
+# GPU_ARCH and MAX_JOBS were both computed in step 4.
+echo "Rebuilding for sm_${GPU_ARCH/./} (TORCH_CUDA_ARCH_LIST=$GPU_ARCH, MAX_JOBS=$MAX_JOBS)"
 
-# Detect GPU compute capability so builds work on any GPU (Blackwell sm_120, A100 sm_80, etc.)
-GPU_ARCH=$(python -c "import torch; cap=torch.cuda.get_device_capability(); print(f'{cap[0]}.{cap[1]}')" 2>/dev/null || echo "8.0")
-echo "Detected GPU compute capability: sm_${GPU_ARCH/./} (TORCH_CUDA_ARCH_LIST=$GPU_ARCH)"
+# A pip constraints file pins torch for THIS step only: the builds below use --force-reinstall
+# without --no-deps, which would otherwise pull the latest torch (2.11) as a dependency and
+# compile the extensions against it — then step 10 pins torch back to 2.7.0 and the .so are
+# ABI-broken ("undefined symbol"). The constraint makes pip keep torch at 2.7.0 during the
+# builds. It is NOT set earlier because '.[dev]' in step 4 intentionally downgrades torch to
+# resolve sam3d-objects' cu121 pins.
+CONSTRAINT_FILE=/workspace/tmp/torch-constraint.txt
+cat > "$CONSTRAINT_FILE" <<'EOF'
+torch==2.7.0+cu128
+torchvision==0.22.0+cu128
+torchaudio==2.7.0+cu128
+numpy==1.26.4
+EOF
+export PIP_CONSTRAINT="$CONSTRAINT_FILE"
 
-# Parallelize the CUDA compiles below via MAX_JOBS, but bound it by RAM: each nvcc unit
-# (flash-attn especially) peaks at several GB, so nproc jobs would OOM-kill the build.
-# IMPORTANT: /proc/meminfo reports HOST RAM inside a container — read the cgroup limit too
-# and take the minimum, or the budget is wildly over-estimated on RunPod.
-mem_host=$(awk '/MemTotal/ {print $2*1024}' /proc/meminfo)   # bytes
-mem_limit=$mem_host
-if [ -r /sys/fs/cgroup/memory.max ]; then                              # cgroup v2
-    v=$(cat /sys/fs/cgroup/memory.max)
-    [ "$v" != "max" ] && mem_limit=$v
-elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then          # cgroup v1
-    v=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
-    [ "$v" -lt "$mem_host" ] && mem_limit=$v
-fi
-RAM_GB=$(( mem_limit / 1024 / 1024 / 1024 ))
-BUFFER_PCT=20        # keep 20% of RAM free
-PER_JOB_GB=3         # conservative per-job RAM peak (flash-attn nvcc)
-usable=$(( RAM_GB * (100 - BUFFER_PCT) / 100 ))
-jobs_by_ram=$(( usable / PER_JOB_GB ))
-[ "$jobs_by_ram" -lt 1 ] && jobs_by_ram=1
-ncpu=$(nproc)
-export MAX_JOBS=$(( jobs_by_ram < ncpu ? jobs_by_ram : ncpu ))
-echo "Build parallelism: RAM ${RAM_GB}GB, ${BUFFER_PCT}% buffer, ~${PER_JOB_GB}GB/job -> MAX_JOBS=$MAX_JOBS (nproc=$ncpu)"
-
-TORCH_CUDA_ARCH_LIST="$GPU_ARCH" pip install "git+https://github.com/facebookresearch/pytorch3d.git" --no-build-isolation
+TORCH_CUDA_ARCH_LIST="$GPU_ARCH" pip install "git+https://github.com/facebookresearch/pytorch3d.git@75ebeeaea0908c5527e7b1e305fbc7681382db47" --no-build-isolation --force-reinstall --no-deps
 TORCH_CUDA_ARCH_LIST="$GPU_ARCH" pip install "gsplat @ git+https://github.com/nerfstudio-project/gsplat.git@2323de5905d5e90e035f792fe65bad0fedd413e7" --force-reinstall
 # Re-pin torch before remaining builds: pytorch3d/gsplat may have pulled a newer torch,
 # and ABI-sensitive packages must be compiled against exactly 2.7.0
@@ -241,7 +285,11 @@ pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128
 TORCH_CUDA_ARCH_LIST="$GPU_ARCH" pip install git+https://github.com/NVlabs/nvdiffrast.git --no-build-isolation --force-reinstall --no-deps
 # diff_gaussian_rasterization and flash_attn are ABI-sensitive — must be rebuilt here
 TORCH_CUDA_ARCH_LIST="$GPU_ARCH" pip install "git+https://github.com/autonomousvision/mip-splatting.git#subdirectory=submodules/diff-gaussian-rasterization" --no-build-isolation --force-reinstall --no-deps
-TORCH_CUDA_ARCH_LIST="$GPU_ARCH" pip install flash-attn --no-build-isolation --force-reinstall --no-deps
+# Pin flash-attn to ==2.8.3 (the version sam3d-objects requires) — NOT latest. Installing
+# latest here would clash with the pin on any later '.[dev]' repair and force a rebuild.
+# 2.8.3 ships a prebuilt wheel for cu12/torch2.7/cxx11abiTRUE/cp311, so this is a fast
+# download, not a compile.
+TORCH_CUDA_ARCH_LIST="$GPU_ARCH" pip install flash-attn==2.8.3 --no-build-isolation --force-reinstall --no-deps
 
 echo "--- 10. Absolute final version pins (overrides anything Step 9 may have pulled) ---"
 pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
@@ -249,7 +297,38 @@ pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128
 pip install numpy==1.26.4 --force-reinstall --no-deps
 pip install nvidia-cusparselt-cu12==0.6.3 --force-reinstall --no-deps
 
+# Drop the step-9 torch constraint so it does not leak into the sourced shell / later installs.
+unset PIP_CONSTRAINT
+
+echo "--- 11. Verification ---"
+# Import every ABI-sensitive package plus sam3d_objects. A broken torch pin or a wrong-torch
+# build surfaces here as an ImportError / "undefined symbol" instead of failing silently at
+# API start. Non-fatal (set -e is off) — it reports, it does not abort.
+python - <<'PYEOF'
+import importlib, sys
+checks = ["torch", "numpy", "kaolin", "pytorch3d", "nvdiffrast",
+          "flash_attn", "xformers.ops", "sam3d_objects"]
+failed = []
+import torch
+print(f"  torch {torch.__version__}  cuda_available={torch.cuda.is_available()}")
+print(f"  numpy {importlib.import_module('numpy').__version__}")
+for m in checks:
+    try:
+        importlib.import_module(m)
+        print(f"  OK   {m}")
+    except Exception as e:
+        print(f"  FAIL {m}: {type(e).__name__}: {e}")
+        failed.append(m)
+print("=== VERIFICATION PASSED ===" if not failed
+      else f"=== VERIFICATION FAILED: {failed} ===")
+sys.exit(1 if failed else 0)
+PYEOF
+VERIFY_RC=$?
+
 echo "--- Setup Complete! ---"
+if [ "$VERIFY_RC" -ne 0 ]; then
+    echo "WARNING: verification reported failures above — env is NOT fully usable yet."
+fi
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
     echo "SUCCESS: You are now active in the '$ENV_PATH' environment."
 else
