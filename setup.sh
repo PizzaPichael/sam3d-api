@@ -39,23 +39,58 @@ fi
 source "$CONDA_ROOT/etc/profile.d/conda.sh"
 conda init bash
 
-# Route all installs to network storage
+# Route installs to network storage. The conda package cache is deliberately NOT on
+# /workspace: that volume is MooseFS, and extracting tens of thousands of small files
+# there produced CondaVerificationError ("package appears to be corrupted"). The cache is
+# throwaway — only the env itself needs to persist.
 export CONDA_ENVS_PATH=/workspace/envs
-export CONDA_PKGS_DIRS=/workspace/conda-pkgs
+export CONDA_PKGS_DIRS=/root/conda-pkgs
 export PIP_CACHE_DIR=/workspace/pip-cache
 export TMPDIR=/workspace/tmp
-mkdir -p /workspace/conda-pkgs /workspace/pip-cache /workspace/tmp
+mkdir -p /root/conda-pkgs /workspace/pip-cache /workspace/tmp
 
 echo "--- 3. Setting up Conda Environment ---"
 ENV_PATH="/workspace/envs/sam3d-objects"
-if [ -d "$ENV_PATH" ]; then
-    echo "Environment '$ENV_PATH' exists. Updating..."
-    conda env update -p "$ENV_PATH" -f environments/default.yml --prune
+# environments/default.yml is deliberately NOT used. It is a full conda export pinning the
+# entire CUDA 12.1 toolkit plus a Qt/X11/audio stack (the cuda-nvvp and cuda-nsight
+# profiler GUIs depend on qt-main). setup.sh overrides all of it anyway: CUDA_HOME points
+# at system CUDA 12.8 because conda's nvcc 12.1 has no sm_120 support, and the CUDA
+# runtime libs arrive as pip nvidia-* wheels with torch. On a fresh volume those unused
+# packages only produced ClobberError (seven cuda-* tools sharing 'LICENSE') and
+# CondaVerificationError (qt-main's translation files over MooseFS).
+# What we need from the env is python 3.11 and a C/C++ toolchain for the step 9 builds.
+#
+# gcc is pinned to 12.4 to match what default.yml specified — nvcc 12.8 also accepts
+# gcc 14, but the native builds (pytorch3d, gsplat, flash-attn) are only tested against 12.
+#
+# The test below checks for bin/python, not the directory: an empty $ENV_PATH left behind
+# by an aborted create passes -d, and conda does not bootstrap python into a non-env.
+# The result is a directory that activates cleanly but has no interpreter.
+if [ -x "$ENV_PATH/bin/python" ]; then
+    echo "Environment '$ENV_PATH' exists. Skipping create."
 else
-    conda env create -p "$ENV_PATH" -f environments/default.yml
+    [ -e "$ENV_PATH" ] && { echo "Removing incomplete env at '$ENV_PATH'..."; rm -rf "$ENV_PATH"; }
+    conda create -p "$ENV_PATH" -c conda-forge -y \
+        python=3.11 pip setuptools wheel \
+        gcc_linux-64=12.4 gxx_linux-64=12.4
 fi
 
 conda activate "$ENV_PATH"
+
+# Guard: 'conda activate' sets CONDA_PREFIX and the prompt even when the env has no
+# bin/python — every python/pip call then falls through to /usr/local/bin/python (system
+# 3.12) and the entire setup installs into the container instead of the volume.
+# set -e is off above, so this must abort explicitly.
+if [ "$(command -v python)" != "$ENV_PATH/bin/python" ]; then
+    echo "#######################################################################"
+    echo "FATAL: conda env is not active."
+    echo "  expected: $ENV_PATH/bin/python"
+    echo "  actual:   $(command -v python)"
+    echo "  See runpod/docs/setup-fixes.md point 12."
+    echo "#######################################################################"
+    return 1 2>/dev/null || exit 1
+fi
+echo "Env active: $(python --version) at $(command -v python)"
 
 # Use system CUDA for all native builds — conda env nvcc is too old and doesn't support sm_120
 # Pick the highest available CUDA version under /usr/local
@@ -74,8 +109,22 @@ pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128
 
 # cu121 included so pip can resolve sam3d-objects' pinned torchaudio==2.5.1+cu121 — overridden in step 5b
 export PIP_EXTRA_INDEX_URL="https://pypi.ngc.nvidia.com https://download.pytorch.org/whl/cu128 https://download.pytorch.org/whl/cu121"
+
+# auto-gptq is an sdist whose setup.py imports torch at build time. pip's build isolation
+# hides the torch installed above, so '.[dev]' below aborts with "No module named 'torch'"
+# and sam3d_objects never gets installed. Pre-install it here so pip sees it as satisfied.
+# BUILD_CUDA_EXT=0 skips the CUDA kernel build — GPTQ quantization is not used in the
+# mesh pipeline, only the import needs to resolve.
+BUILD_CUDA_EXT=0 pip install auto-gptq==0.7.1 --no-build-isolation
+
 pip install -e '.[dev]'
 pip install -e '.[p3d]'
+
+# '.[dev]' silently continues on failure (set -e is off) — verify the package actually landed
+python -c "import sam3d_objects" 2>/dev/null || {
+    echo "WARNING: sam3d_objects not importable after '.[dev]' — retrying without build isolation"
+    pip install -e '.[dev]' --no-build-isolation
+}
 
 echo "--- 5. Installing Inference deps (manual, bypassing sam3d cu121 pins) ---"
 # Install requirements.inference.txt manually to avoid sam3d-objects resolving torchaudio==2.5.1+cu121
@@ -159,7 +208,7 @@ pip install nvidia-cusparselt-cu12==0.6.3 --force-reinstall --no-deps
 
 echo "--- Setup Complete! ---"
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
-    echo "SUCCESS: You are now active in the '$ENV_NAME' environment."
+    echo "SUCCESS: You are now active in the '$ENV_PATH' environment."
 else
-    echo "To activate the environment now, run: conda activate $ENV_NAME"
+    echo "To activate the environment now, run: conda activate $ENV_PATH"
 fi
