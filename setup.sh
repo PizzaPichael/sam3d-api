@@ -160,6 +160,13 @@ fi
 
 echo "--- 6. Downloading Model Checkpoints ---"
 pip install 'huggingface-hub[cli]<1.0'
+# Install + enable hf_transfer BEFORE the download, not after (it used to be in step 7).
+# hf_transfer is a Rust downloader that splits each file into parallel chunks — the two
+# big checkpoints (ss_generator 6.7 GB, slat_generator 4.9 GB) are ~87% of the payload,
+# so per-file chunking matters far more than --max-workers (which only parallelizes
+# across files). --max-workers 4 additionally overlaps the many small files.
+pip install hf_transfer
+export HF_HUB_ENABLE_HF_TRANSFER=1
 
 TAG=hf
 if [ ! -d "checkpoints/${TAG}" ]; then
@@ -167,7 +174,7 @@ if [ ! -d "checkpoints/${TAG}" ]; then
     huggingface-cli download \
       --repo-type model \
       --local-dir checkpoints/${TAG}-download \
-      --max-workers 1 \
+      --max-workers 4 \
       facebook/sam-3d-objects
 
     mv checkpoints/${TAG}-download/checkpoints checkpoints/${TAG}
@@ -181,7 +188,7 @@ cd ..
 if [ -f "requirements.txt" ]; then
     echo "Installing requirements.txt from $(pwd)..."
     pip install -r requirements.txt
-    pip install hf_transfer
+    # hf_transfer moved to step 6 (must be installed before the checkpoint download)
     pip install git+https://github.com/NVlabs/nvdiffrast.git --no-build-isolation
 else
     echo "No requirements.txt found in $(pwd)."
@@ -201,6 +208,29 @@ echo "--- 9. Rebuilding native extensions against final torch 2.7.0+cu128 ---"
 # Detect GPU compute capability so builds work on any GPU (Blackwell sm_120, A100 sm_80, etc.)
 GPU_ARCH=$(python -c "import torch; cap=torch.cuda.get_device_capability(); print(f'{cap[0]}.{cap[1]}')" 2>/dev/null || echo "8.0")
 echo "Detected GPU compute capability: sm_${GPU_ARCH/./} (TORCH_CUDA_ARCH_LIST=$GPU_ARCH)"
+
+# Parallelize the CUDA compiles below via MAX_JOBS, but bound it by RAM: each nvcc unit
+# (flash-attn especially) peaks at several GB, so nproc jobs would OOM-kill the build.
+# IMPORTANT: /proc/meminfo reports HOST RAM inside a container — read the cgroup limit too
+# and take the minimum, or the budget is wildly over-estimated on RunPod.
+mem_host=$(awk '/MemTotal/ {print $2*1024}' /proc/meminfo)   # bytes
+mem_limit=$mem_host
+if [ -r /sys/fs/cgroup/memory.max ]; then                              # cgroup v2
+    v=$(cat /sys/fs/cgroup/memory.max)
+    [ "$v" != "max" ] && mem_limit=$v
+elif [ -r /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then          # cgroup v1
+    v=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
+    [ "$v" -lt "$mem_host" ] && mem_limit=$v
+fi
+RAM_GB=$(( mem_limit / 1024 / 1024 / 1024 ))
+BUFFER_PCT=20        # keep 20% of RAM free
+PER_JOB_GB=3         # conservative per-job RAM peak (flash-attn nvcc)
+usable=$(( RAM_GB * (100 - BUFFER_PCT) / 100 ))
+jobs_by_ram=$(( usable / PER_JOB_GB ))
+[ "$jobs_by_ram" -lt 1 ] && jobs_by_ram=1
+ncpu=$(nproc)
+export MAX_JOBS=$(( jobs_by_ram < ncpu ? jobs_by_ram : ncpu ))
+echo "Build parallelism: RAM ${RAM_GB}GB, ${BUFFER_PCT}% buffer, ~${PER_JOB_GB}GB/job -> MAX_JOBS=$MAX_JOBS (nproc=$ncpu)"
 
 TORCH_CUDA_ARCH_LIST="$GPU_ARCH" pip install "git+https://github.com/facebookresearch/pytorch3d.git" --no-build-isolation
 TORCH_CUDA_ARCH_LIST="$GPU_ARCH" pip install "gsplat @ git+https://github.com/nerfstudio-project/gsplat.git@2323de5905d5e90e035f792fe65bad0fedd413e7" --force-reinstall
