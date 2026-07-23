@@ -1,14 +1,27 @@
 #!/bin/bash
 
-# 1. Check if the script is being sourced
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    echo "#######################################################################"
-    echo "WARNING: You are running this script as a subshell (./setup.sh)."
-    echo "To remain inside the conda environment after the script finishes,"
-    echo "please run: source setup.sh"
-    echo "#######################################################################"
-    sleep 2
+# This setup runs 15-30 min (13 GB checkpoint download + native CUDA builds) and must
+# survive an SSH drop — a dropped connection otherwise sends SIGHUP and kills it mid-build.
+# Unless we are already inside tmux, relaunch inside a persistent 'setup' session.
+#   detach:   Ctrl-b then d
+#   reattach: tmux attach -t setup
+if [ -z "$TMUX" ]; then
+    if ! command -v tmux >/dev/null 2>&1; then
+        echo "WARNING: tmux not found. Run 'apt-get install -y tmux' first, or this setup"
+        echo "         will die if the SSH connection drops. Continuing without it in 3s..."
+        sleep 3
+    else
+        SETUP_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+        echo "Relaunching inside tmux session 'setup' (detach: Ctrl-b d | reattach: tmux attach -t setup)"
+        # -A: attach if 'setup' already exists (reconnect), otherwise create and run.
+        # 'exec bash' keeps the pane alive after setup finishes so the final output stays visible.
+        tmux new-session -A -s setup "cd '$(dirname "$SETUP_PATH")' && bash '$SETUP_PATH'; exec bash"
+        return 0 2>/dev/null || exit 0
+    fi
 fi
+
+# Exit on error (disabled: sam3d-objects has pinned cu121 deps that cause non-fatal resolution warnings)
+# set -e
 
 # Exit on error (disabled: sam3d-objects has pinned cu121 deps that cause non-fatal resolution warnings)
 # set -e
