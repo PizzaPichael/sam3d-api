@@ -34,6 +34,9 @@ os.environ["NUMEXPR_NUM_THREADS"] = "4"
 
 import io
 import base64
+import threading
+import queue
+import time
 import numpy as np
 import torch
 
@@ -120,6 +123,61 @@ processor = None
 # Task storage for async 3D generation
 generation_tasks: Dict[str, Dict] = {}
 
+# ============================================================================
+# Persistent 3D generation worker
+# The worker loads the Sam-3d-objects pipeline once and processes jobs from
+# stdin. This replaces the old per-request subprocess which reloaded all
+# checkpoints on every request (minutes of overhead per generation).
+# ============================================================================
+worker_proc: Optional[subprocess.Popen] = None
+worker_ready = False
+worker_lock = threading.Lock()  # serializes jobs (one GPU, one worker)
+worker_results: "queue.Queue[Dict]" = queue.Queue()
+
+WORKER_EXIT_SENTINEL = {"status": "worker_exit"}
+
+
+def _worker_reader(proc: subprocess.Popen):
+    """Reads worker stdout: READY signal + one JSON result line per job."""
+    global worker_ready
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        line = line.strip()
+        if not line:
+            continue
+        if line == "READY":
+            worker_ready = True
+            print("[API] ✓ 3D worker ready")
+            continue
+        try:
+            worker_results.put(json.loads(line))
+        except json.JSONDecodeError:
+            print(f"[API] Ignoring non-JSON worker output: {line[:200]}")
+    worker_ready = False
+    print(f"[API] 3D worker exited (returncode={proc.poll()})")
+    worker_results.put(dict(WORKER_EXIT_SENTINEL))
+
+
+def start_worker():
+    """Spawn the persistent 3D worker and its stdout reader thread."""
+    global worker_proc, worker_ready
+    worker_ready = False
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    worker_script = os.path.join(script_dir, "worker_3d.py")
+
+    print("[API] Starting persistent 3D worker...")
+    worker_proc = subprocess.Popen(
+        [sys.executable, "-u", worker_script, ASSETS_DIR],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=None,  # worker diagnostics go straight to the API console
+        text=True,
+        bufsize=1,
+    )
+    threading.Thread(
+        target=_worker_reader, args=(worker_proc,), daemon=True
+    ).start()
+
 
 def initialize_model():
     """Initialize SAM 2 model and processor from Hugging Face"""
@@ -143,6 +201,7 @@ def initialize_model():
 async def startup_event():
     """Initialize models on API startup"""
     initialize_model()
+    start_worker()
 
 
 @app.get("/health")
@@ -153,6 +212,7 @@ async def health_check():
         "model_loaded": model is not None and processor is not None,
         "device": str(device),
         "model": "facebook/sam2.1-hiera-large",
+        "worker_ready": worker_ready,
     }
 
 
@@ -463,169 +523,79 @@ def _generate_3d_background(
 ):
     """
     Background task for 3D generation.
-    This function updates the generation_tasks dict with status and results.
+    Sends the job to the persistent worker and waits for its result line.
+    Updates the generation_tasks dict with status and results.
     """
-    ply_temp_path = None
-    gif_temp_path = None
-
     try:
         generation_tasks[task_id]["status"] = "processing"
 
-        # Create temp file for output PLY
-        with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as tmp:
-            ply_temp_path = tmp.name
-            gif_temp_path = ply_temp_path.replace(".ply", ".gif")
+        with worker_lock:
+            # Restart worker if it died (e.g. CUDA OOM on a previous job)
+            if worker_proc is None or worker_proc.poll() is not None:
+                print(f"[Task {task_id}] Worker not running, restarting...")
+                start_worker()
 
-        # Get the directory of the current script
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        subprocess_script = os.path.join(script_dir, "generate_3d_subprocess.py")
+            proc = worker_proc
+            assert proc is not None
 
-        print(f"[Task {task_id}] Running 3D generation in subprocess...")
+            # Wait for worker to finish loading the pipeline (first start only)
+            wait_start = time.time()
+            while not worker_ready:
+                if proc.poll() is not None:
+                    raise RuntimeError(
+                        "3D worker exited during startup - check API logs"
+                    )
+                if time.time() - wait_start > 600:
+                    raise RuntimeError("3D worker did not become ready within 600s")
+                time.sleep(1)
 
-        # Run subprocess
-        result = subprocess.run(
-            [
-                sys.executable,
-                subprocess_script,
-                image_temp_path,
-                mask_temp_path,
-                str(seed),
-                ply_temp_path,
-                ASSETS_DIR,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=600,  # 10 minute timeout
+            # Drain stale results (e.g. from a previously timed-out job)
+            while not worker_results.empty():
+                try:
+                    stale = worker_results.get_nowait()
+                    print(f"[Task {task_id}] Discarding stale worker result: {stale}")
+                except queue.Empty:
+                    break
+
+            job = {
+                "job_id": task_id,
+                "image_path": image_temp_path,
+                "mask_path": mask_temp_path,
+                "seed": seed,
+            }
+            print(f"[Task {task_id}] Sending job to 3D worker...")
+            assert proc.stdin is not None
+            proc.stdin.write(json.dumps(job) + "\n")
+            proc.stdin.flush()
+
+            try:
+                result = worker_results.get(timeout=600)
+            except queue.Empty:
+                raise RuntimeError("3D generation timed out (exceeded 10 minutes)")
+
+        if result.get("status") == "worker_exit":
+            raise RuntimeError("3D worker crashed during generation - check API logs")
+
+        if result.get("status") != "completed":
+            generation_tasks[task_id]["status"] = "failed"
+            generation_tasks[task_id]["error"] = result.get("error", "Unknown error")
+            print(f"[Task {task_id}] Worker reported failure: {result.get('error')}")
+            return
+
+        print(
+            f"[Task {task_id}] ✓ 3D generation successful: {result.get('mesh_url')} "
+            f"({result.get('mesh_size_bytes')} bytes, "
+            f"inference {result.get('inference_seconds')}s)"
         )
-
-        # Print subprocess output for debugging
-        if result.stdout:
-            print(f"[Task {task_id}][Subprocess stdout]:\n{result.stdout}")
-        if result.stderr:
-            print(f"[Task {task_id}][Subprocess stderr]:\n{result.stderr}")
-
-        # Check if subprocess succeeded
-        if result.returncode != 0:
-            error_msg = result.stderr if result.stderr else result.stdout
-            print(
-                f"[Task {task_id}] Subprocess failed with return code {result.returncode}"
-            )
-
-            generation_tasks[task_id]["status"] = "failed"
-            generation_tasks[task_id]["error"] = error_msg
-            return
-
-        # Extract GIF data from subprocess output
-        gif_b64 = None
-        if "GIF_DATA_START" in result.stdout and "GIF_DATA_END" in result.stdout:
-            try:
-                start_idx = result.stdout.find("GIF_DATA_START") + len("GIF_DATA_START")
-                end_idx = result.stdout.find("GIF_DATA_END")
-                gif_b64 = result.stdout[start_idx:end_idx].strip()
-                print(
-                    f"[Task {task_id}] ✓ Extracted GIF: {len(gif_b64)} chars (base64)"
-                )
-            except Exception as e:
-                print(f"[Task {task_id}] Warning: Could not extract GIF data: {e}")
-
-        # Extract mesh URL from subprocess output
-        mesh_url = None
-        if "MESH_URL_START" in result.stdout and "MESH_URL_END" in result.stdout:
-            try:
-                start_idx = result.stdout.find("MESH_URL_START") + len("MESH_URL_START")
-                end_idx = result.stdout.find("MESH_URL_END")
-                mesh_url = result.stdout[start_idx:end_idx].strip()
-                print(f"[Task {task_id}] ✓ Extracted mesh URL: {mesh_url}")
-            except Exception as e:
-                print(f"[Task {task_id}] Warning: Could not extract mesh URL: {e}")
-
-        # Extract PLY URL from subprocess output
-        ply_url = None
-        if "PLY_URL_START" in result.stdout and "PLY_URL_END" in result.stdout:
-            try:
-                start_idx = result.stdout.find("PLY_URL_START") + len("PLY_URL_START")
-                end_idx = result.stdout.find("PLY_URL_END")
-                ply_url = result.stdout[start_idx:end_idx].strip()
-                print(f"[Task {task_id}] ✓ Extracted PLY URL: {ply_url}")
-            except Exception as e:
-                print(f"[Task {task_id}] Warning: Could not extract PLY URL: {e}")
-
-        # Always read PLY as primary output
-        ply_b64 = None
-        ply_size_bytes = None
-
-        if os.path.exists(ply_temp_path):
-            print(f"[Task {task_id}] Reading PLY from {ply_temp_path}")
-            with open(ply_temp_path, "rb") as f:
-                ply_bytes = f.read()
-
-            # Validate PLY header
-            try:
-                header_text = ply_bytes[: min(50000, len(ply_bytes))].decode(
-                    "utf-8", errors="ignore"
-                )
-                if "end_header" not in header_text:
-                    print(
-                        f"[Task {task_id}] WARNING: PLY missing 'end_header' in first 50KB"
-                    )
-                    print(
-                        f"[Task {task_id}] PLY appears to be binary, checking full file..."
-                    )
-                    # Check entire file
-                    full_text = ply_bytes.decode("utf-8", errors="ignore")
-                    if "end_header" not in full_text:
-                        print(
-                            f"[Task {task_id}] ERROR: PLY file corrupted or not ASCII format"
-                        )
-                    else:
-                        print(
-                            f"[Task {task_id}] Found end_header after 50KB - file is large but valid"
-                        )
-                else:
-                    print(f"[Task {task_id}] ✓ PLY header valid (ASCII format)")
-            except Exception as e:
-                print(f"[Task {task_id}] Warning: Could not validate PLY header: {e}")
-
-            ply_b64 = base64.b64encode(ply_bytes).decode("utf-8")
-            ply_size_bytes = len(ply_bytes)
-            print(f"[Task {task_id}] ✓ PLY loaded: {ply_size_bytes} bytes")
-
-        # GIF data was already extracted from subprocess stdout above
-        gif_size_bytes = len(gif_b64) if gif_b64 else None
-
-        # Determine primary output (for backward compatibility)
-        output_b64 = ply_b64 if ply_b64 else gif_b64
-        output_type = "ply" if ply_b64 else "gif"
-        output_size_bytes = ply_size_bytes if ply_b64 else gif_size_bytes
-
-        if output_b64:
-            print(
-                f"[Task {task_id}] ✓ 3D generation successful ({output_type}): {output_size_bytes} bytes"
-            )
-        else:
-            generation_tasks[task_id]["status"] = "failed"
-            generation_tasks[task_id][
-                "error"
-            ] = "Neither GIF nor PLY file was generated"
-            return
-
         generation_tasks[task_id]["status"] = "completed"
-        generation_tasks[task_id]["output_b64"] = output_b64
-        generation_tasks[task_id]["output_type"] = output_type
-        generation_tasks[task_id]["output_size_bytes"] = output_size_bytes
-        generation_tasks[task_id]["ply_b64"] = ply_b64
-        generation_tasks[task_id]["ply_size_bytes"] = ply_size_bytes
-        generation_tasks[task_id]["ply_url"] = ply_url
-        generation_tasks[task_id]["gif_b64"] = gif_b64
-        generation_tasks[task_id]["gif_size_bytes"] = gif_size_bytes
-        generation_tasks[task_id]["mesh_url"] = mesh_url
+        generation_tasks[task_id]["mesh_url"] = result.get("mesh_url")
+        generation_tasks[task_id]["mesh_format"] = result.get("mesh_format", "glb")
+        generation_tasks[task_id]["mesh_size_bytes"] = result.get("mesh_size_bytes")
+        generation_tasks[task_id]["inference_seconds"] = result.get(
+            "inference_seconds"
+        )
         generation_tasks[task_id]["progress"] = 100
 
-    except subprocess.TimeoutExpired:
-        generation_tasks[task_id]["status"] = "failed"
-        generation_tasks[task_id][
-            "error"
-        ] = "3D generation timed out (exceeded 10 minutes)"
     except Exception as e:
         print(f"[Task {task_id}] Error in 3D generation: {e}")
         import traceback
@@ -635,7 +605,7 @@ def _generate_3d_background(
         generation_tasks[task_id]["error"] = str(e)
     finally:
         # Clean up temporary files
-        for path in [image_temp_path, mask_temp_path, ply_temp_path, gif_temp_path]:
+        for path in [image_temp_path, mask_temp_path]:
             if path and os.path.exists(path):
                 try:
                     os.unlink(path)
@@ -755,7 +725,8 @@ async def generate_3d_status(task_id: str):
         JSON response containing:
         - status: "queued", "processing", "completed", or "failed"
         - progress: 0-100 (if applicable)
-        - ply_b64: Base64 encoded PLY file (if completed)
+        - mesh_url: Download path for the GLB (if completed), e.g. /assets/mesh_x.glb
+        - mesh_format, mesh_size_bytes, inference_seconds (if completed)
         - error: Error message (if failed)
     """
     if task_id not in generation_tasks:
@@ -773,48 +744,10 @@ async def generate_3d_status(task_id: str):
     }
 
     if task["status"] == "completed":
-        response["ply_b64"] = task.get("output_b64")
-        response["ply_size_bytes"] = task.get("output_size_bytes")
-        response["gif_b64"] = task.get("gif_b64")
-        response["gif_size_bytes"] = task.get("gif_size_bytes")
         response["mesh_url"] = task.get("mesh_url")
-
-        # Encode mesh file to base64 if URL exists
-        mesh_url = task.get("mesh_url")
-        if mesh_url:
-            mesh_filename = mesh_url.split("/")[-1]
-            mesh_path = os.path.join(ASSETS_DIR, mesh_filename)
-
-            # Detect mesh format from file extension
-            if mesh_filename.endswith(".glb"):
-                response["mesh_format"] = "glb"
-            elif mesh_filename.endswith(".ply"):
-                response["mesh_format"] = "ply"
-            else:
-                response["mesh_format"] = "unknown"
-
-            if os.path.exists(mesh_path):
-                try:
-                    with open(mesh_path, "rb") as f:
-                        mesh_bytes = f.read()
-                    response["mesh_b64"] = base64.b64encode(mesh_bytes).decode("utf-8")
-                    response["mesh_size_bytes"] = len(mesh_bytes)
-                except Exception as e:
-                    print(f"[API] Warning: Could not encode mesh to base64: {e}")
-                    response["mesh_b64"] = None
-                    response["mesh_size_bytes"] = 0
-            else:
-                print(f"[API] Warning: Mesh file not found at {mesh_path}")
-                response["mesh_b64"] = None
-                response["mesh_size_bytes"] = 0
-        else:
-            response["mesh_b64"] = None
-            response["mesh_size_bytes"] = 0
-
-        # Also include new naming convention
-        response["output_b64"] = task.get("output_b64")
-        response["output_type"] = task.get("output_type")  # "gif" or "ply"
-        response["output_size_bytes"] = task.get("output_size_bytes")
+        response["mesh_format"] = task.get("mesh_format", "glb")
+        response["mesh_size_bytes"] = task.get("mesh_size_bytes")
+        response["inference_seconds"] = task.get("inference_seconds")
     elif task["status"] == "failed":
         response["error"] = task.get("error", "Unknown error")
 
