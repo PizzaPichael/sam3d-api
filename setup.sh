@@ -194,6 +194,11 @@ pip install seaborn==0.13.2 gradio==5.49.0
 pip install "gsplat @ git+https://github.com/nerfstudio-project/gsplat.git@2323de5905d5e90e035f792fe65bad0fedd413e7"
 pip install kaolin==0.18.0 \
     -f https://nvidia-kaolin.s3.us-east-2.amazonaws.com/torch-2.7.0_cu128.html
+# sam-3d-objects/notebook/inference.py imports omegaconf directly (not just via hydra-core).
+# Normally pulled in transitively by hydra-core through '.[dev]' above, but a repair session
+# that re-registers sam3d_objects via '-e . --no-deps' skips it entirely and the worker then
+# crashes with ModuleNotFoundError at first job. Explicit install so it's never missing.
+pip install omegaconf
 
 echo "--- 5b. cu128 overrides ---"
 pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \

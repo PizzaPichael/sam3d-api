@@ -14,6 +14,33 @@ fi
 
 source /root/miniconda3/etc/profile.d/conda.sh
 export CONDA_ENVS_PATH=/workspace/envs
+
+# Mirror the conda env to local container disk and bind-mount it OVER the original
+# network-volume path, so every path baked into the env (conda metadata, shebangs like
+# '#!/workspace/envs/sam3d-objects/bin/python3.11') keeps working unchanged — only the
+# storage backing that path switches from network (MooseFS/FUSE) to local NVMe. This is
+# what makes 'import torch/kaolin/pytorch3d/nvdiffrast/xformers/sam3d_objects' take
+# 10-20+ min on every pod start (see README "Known runtime quirks") — env files get read
+# fresh from the network volume every time otherwise.
+#
+# Requires CAP_SYS_ADMIN for 'mount --bind', which this container may not have (same class
+# of restriction that blocks py-spy's ptrace). Falls back to running from the network
+# volume unchanged if the mount isn't permitted — no new failure mode either way.
+LOCAL_ENV_MIRROR=/root/sam3d-env-local
+if ! mountpoint -q "$ENV_PATH" 2>/dev/null; then
+    if [ ! -x "$LOCAL_ENV_MIRROR/bin/python" ]; then
+        echo "Mirroring conda env to local disk ($LOCAL_ENV_MIRROR) for faster imports on future starts — one-time, can take a while..."
+        mkdir -p "$LOCAL_ENV_MIRROR"
+        cp -a "$ENV_PATH/." "$LOCAL_ENV_MIRROR/"
+        echo "Env mirror done."
+    fi
+    if mount --bind "$LOCAL_ENV_MIRROR" "$ENV_PATH" 2>/dev/null; then
+        echo "Conda env now served from local disk (bind-mounted over $ENV_PATH)."
+    else
+        echo "NOTE: bind-mount not permitted in this container — running from the network volume as before (no speedup, nothing broken)."
+    fi
+fi
+
 conda activate "$ENV_PATH"
 
 # Guard: 'conda activate' setzt CONDA_PREFIX auch dann, wenn das Env nur ein leeres

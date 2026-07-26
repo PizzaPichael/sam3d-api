@@ -48,10 +48,15 @@ bash install_conda_start_env_host_api.sh
 
 This script:
 1. Reinstalls miniconda if missing (it lives on the container disk, not the volume — gone after "Terminate", kept after "Stop")
-2. Activates the `sam3d-objects` conda env
-3. Exports the runtime env vars the env needs (see [Known runtime quirks](#known-runtime-quirks) below)
-4. Copies checkpoints from the network volume to local container disk (`/root/sam3d-checkpoints`) once per pod — the worker then loads from fast local NVMe instead of the slower network volume
-5. Starts `uvicorn api:app --host 0.0.0.0 --port 8000` in the foreground
+2. Mirrors the conda env itself to local container disk and bind-mounts it over the original `/workspace/envs/sam3d-objects` path (once per pod) — see below
+3. Activates the `sam3d-objects` conda env
+4. Exports the runtime env vars the env needs (see [Known runtime quirks](#known-runtime-quirks) below)
+5. Copies checkpoints from the network volume to local container disk (`/root/sam3d-checkpoints`) once per pod — the worker then loads from fast local NVMe instead of the slower network volume
+6. Starts `uvicorn api:app --host 0.0.0.0 --port 8000` in the foreground, with a background monitor that logs progress (memory growth + `/health` polling) every 20s until the API responds — the import chain below can take 10-20+ min on first read, this makes that visible instead of a silent wait
+
+**Why the env gets mirrored:** `torch`/`kaolin`/`pytorch3d`/`nvdiffrast`/`flash-attn`/`xformers`/`sam3d_objects` are read off `/workspace` — a network volume (MooseFS/FUSE) — on every single import, every pod start. That's what makes `api.py`'s startup imports take 10-20+ min. The script copies the whole env to local NVMe once and bind-mounts it back over the original path, so conda metadata and shebangs (which hardcode `/workspace/envs/sam3d-objects`) keep working unchanged — only the storage backing that path switches from network to local.
+
+This needs `CAP_SYS_ADMIN` for `mount --bind`, which the container may not grant (RunPod pods have refused comparable low-level operations before, e.g. `ptrace` for `py-spy`). If the mount is refused, the script logs a note and continues running from the network volume as before — no new failure mode, just no speedup.
 
 Run it inside `tmux` if you want to detach and keep the API running after disconnecting:
 ```bash
@@ -88,6 +93,11 @@ pip install nvidia-cusparselt-cu12==0.6.3 --force-reinstall --no-deps
 cd /workspace/sam3d-api/sam-3d-objects
 pip install -e '.' --no-deps
 python -c "import sam3d_objects; print('sam3d OK')"
+
+# '--no-deps' above skips omegaconf too — sam-3d-objects/notebook/inference.py imports it
+# directly, so the worker crashes on the first job otherwise (ModuleNotFoundError, not caught
+# until you actually try a /generate-3d call)
+pip install omegaconf
 ```
 
 **Verify the full env in one shot** (separate `python -c` calls each pay the full torch-import cost again on network storage — combine into one process):
@@ -115,6 +125,7 @@ These are already handled by `install_conda_start_env_host_api.sh` (and `LIDRA_S
 | `ImportError: Requires Flash-Attention version >=2.7.1,<=2.7.4 but got 2.8.3` on `import xformers.ops` | flash-attn 2.8.3 is the only prebuilt wheel available for sm_120/Blackwell; xformers 0.0.30 only tests against 2.7.x | `export XFORMERS_IGNORE_FLASH_VERSION_CHECK=1` — bypasses the version *check* only, the actual flash-attn bindings still load. Verified numerically compatible (see `runpod/docs/resume-schekclist-24_07.md` in the `MixedRealityInteriorArrangement` repo for the correctness test) |
 | `ModuleNotFoundError: No module named 'appdirs'` while building `nvidia-pyindex` | its `setup.py` needs `appdirs` even under `--no-build-isolation` | `pip install appdirs` first |
 | `numpy` silently downgraded/upgraded after installing `moge`/`utils3d` | those packages were installed without `--no-deps`, pulling their own numpy pin | re-pin per the repair snippet above |
+| `[API] 3D worker exited` right after startup, worker log shows `ModuleNotFoundError: No module named 'omegaconf'` | `sam-3d-objects/notebook/inference.py` imports `omegaconf` directly; re-registering `sam3d_objects` via `-e '.' --no-deps` (repair path) skips it | `pip install omegaconf` — `setup.sh` now installs it explicitly too, so a fresh setup shouldn't hit this |
 
 Also worth knowing: **`miniconda` (`/root/miniconda3`) lives on the container disk, not the network volume.** It survives a pod **Stop**, but not a **Terminate** — a Terminate needs `resume.sh`/`install_conda_start_env_host_api.sh` to reinstall it (automatic, no data loss — the conda env itself is on `/workspace` and survives).
 
