@@ -51,4 +51,29 @@ fi
 export SAM3D_CHECKPOINT_DIR="$LOCAL_CKPT"
 
 cd /workspace/sam3d-api
+
+# api.py's module-level imports (torch, kaolin, pytorch3d, nvdiffrast, xformers,
+# sam3d_objects) read their .so/.py files off the /workspace network volume (MooseFS/FUSE)
+# and print nothing while doing so — this can silently take 10-20+ min with the process
+# sitting at 0% CPU (blocked on FUSE I/O, not hung). Background monitor below reports
+# progress via RSS growth and polls /health, so this isn't a blind wait. It exits on its
+# own once the API responds, or is killed via the trap when uvicorn exits/is interrupted.
+(
+    start=$(date +%s)
+    while true; do
+        sleep 20
+        pid=$(pgrep -f "uvicorn api:app" | head -1)
+        [ -z "$pid" ] && break
+        elapsed=$(( $(date +%s) - start ))
+        if curl -sf -o /dev/null http://localhost:8000/health; then
+            echo "[startup-monitor] API responding after ${elapsed}s."
+            break
+        fi
+        rss_kb=$(awk '/VmRSS/ {print $2}' "/proc/$pid/status" 2>/dev/null)
+        echo "[startup-monitor] still loading... ${elapsed}s elapsed, uvicorn RSS=${rss_kb:-?} kB (growing = alive, stuck for minutes = actually stalled)"
+    done
+) &
+monitor_pid=$!
+trap 'kill $monitor_pid 2>/dev/null' EXIT
+
 uvicorn api:app --host 0.0.0.0 --port 8000
