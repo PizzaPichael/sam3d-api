@@ -1,288 +1,207 @@
-# SAM 2 Segmentation + Sam-3d-objects 3D Generation API 🔧✨
+# sam3d-api
 
-A small FastAPI service that:
+FastAPI service that runs on a RunPod GPU pod:
 
-- Runs Meta's Segment Anything Model 2 (SAM 2) to produce segmentation masks from point clicks
-- Invokes the `sam-3d-objects` pipeline to generate a 3D Gaussian splat and export a PLY/GIF
+1. **SAM 2** (Hugging Face `facebook/sam2.1-hiera-large`) — point-based image segmentation
+2. **Sam-3d-objects** (Meta, `facebook/sam-3d-objects`) — turns an image + mask into a textured 3D mesh (GLB)
 
-This repo contains a single HTTP API (`api.py`) and a subprocess wrapper (`generate_3d_subprocess.py`) which runs the heavier Sam-3d-objects inference in a separate process to avoid GPU/spconv state issues.
+This README covers **setup and operating the pod**. For the API contract (endpoints, request/response shapes) see [API Reference](#api-reference) below. The original, more narrative README is kept at [`README-old.md`](README-old.md).
 
-![preview](https://github.com/user-attachments/assets/6f0d652f-7c91-4c77-8e1d-70359b187d49)
-
-> 🚧 **Note**
->
-> This project is meant to work in conjunction with the mobile app - [Sam3D Mobile](https://github.com/andrisgauracs/sam3d-mobile)
+Everything here targets a RunPod pod with a **Network Volume mounted at `/workspace`** — that's where the conda env, the repo, and the model checkpoints live so they survive a pod stop/restart. Scripts assume the repo is checked out at `/workspace/sam3d-api`.
 
 ---
 
-## Features ✅
+## Prerequisites
 
-- POST `/segment` — single-point segmentation (returns one or multiple masks)
-- POST `/segment-binary` — multi-point segmentation that returns a masked image (PNG, base64)
-- POST `/generate-3d` — async 3D generation from image+mask (returns a task_id to poll)
-- GET `/generate-3d-status/{task_id}` — poll for PLY/GIF results or error
-- GET `/assets-list` — list saved PLY/GIF assets
-- Health check: GET `/health`
+- RunPod GPU pod (tested on RTX PRO 4500 Blackwell / sm_120; `setup.sh` detects the GPU's compute capability automatically, so other architectures — e.g. A40/A100 — should need little to no manual patching, likely less than sm_120 needed since prebuilt wheels for older architectures are more widely available)
+- Network Volume mounted at `/workspace`
+- Hugging Face account with access to the gated `facebook/sam-3d-objects` model, and a token (`hf auth login`)
+- `tmux` available (`apt-get install -y tmux`) — `setup.sh` runs 15-30 min and auto-relaunches itself inside a `tmux` session so an SSH drop doesn't kill it mid-build
 
 ---
 
-## Requirements & Ops ⚙️
-
-- Python 3.10+ recommended
-- GPU recommended for speed (CUDA supported); MPS fallback is used on macOS where available
-- Optional: `open3d` for mesh simplification (not required)
-
-Dependencies are in `requirements.txt` and the repo includes `setup.sh` to bootstrap `sam-3d-objects` and a Conda environment.
-
-Key packages include: `fastapi`, `uvicorn`, `torch`, `transformers`, `opencv-python`, `trimesh`, etc.
-
----
-
-## Quick Setup (summary) 🛠️
-
-1. Install the Hugging Face CLI and authenticate:
+## First-time setup (fresh pod / empty volume)
 
 ```bash
+cd /workspace
+git clone <this-repo-url> sam3d-api
+cd sam3d-api
+
 pip install 'huggingface-hub[cli]<1.0'
 hf auth login
-```
 
-2. Run the repo setup (clones `sam-3d-objects`, creates conda env, installs deps, and downloads checkpoints):
-
-```bash
 source setup.sh
 ```
 
-3. Ensure the `sam-3d-objects` repository and checkpoints are present under the repository root (the setup script places them at `./sam-3d-objects`).
+`setup.sh` is idempotent — safe to re-run, it skips steps that already succeeded (existing conda env, existing checkpoints). It handles, in order: conda env creation, PyTorch 2.7.0+cu128, the `sam3d-objects` package + its native-extension dependencies (pytorch3d, flash-attn, xformers, kaolin, spconv, nvdiffrast, gsplat), and the ~13.3 GB checkpoint download.
 
-> Note: The subprocess currently uses fixed paths and expects:
->
-> - `./sam-3d-objects/notebook`
-> - `./sam-3d-objects/checkpoints/hf/pipeline.yaml`
->   Do not rely on changing these paths via environment variables unless you update the code.
+Runs inside `tmux` automatically. If it drops: `tmux attach -t setup`.
 
 ---
 
-## Environment variables and notes ❗
-
-Note: The subprocess expects the following fixed paths (relative to the repo root):
-
-- `./sam-3d-objects/notebook` — the `sam-3d-objects` notebook folder required by the subprocess (fixed path).
-- `./sam-3d-objects/checkpoints/hf/pipeline.yaml` — the `sam-3d-objects` pipeline config (fixed path used by the subprocess).
-
-Important runtime environment requirements (these are already set in `api.py` and `generate_3d_subprocess.py` but are useful to know):
-
-- Several env vars are set before importing `torch` / `spconv` to avoid tuning issues (e.g., `SPCONV_TUNE_DEVICE`, `SPCONV_ALGO_TIME_LIMIT`).
-- For macOS, `PYTORCH_ENABLE_MPS_FALLBACK=1` is set as a fallback.
-
-> ⚠️ The 3D generation is executed in a subprocess (`generate_3d_subprocess.py`) to avoid state conflicts with spconv / Sam-3d-objects. The subprocess expects the Sam-3d-objects repo and the checkpoints to be available.
-
----
-
-## Running the API (development) ▶️
-
-You can run the app directly with Python, or use **Uvicorn** (recommended) for a cleaner server and easy configuration.
-
-### Launch with Uvicorn (development)
-
-Auto-reload (recommended for development):
+## Daily start (after a pod stop/restart)
 
 ```bash
-uvicorn api:app --host 0.0.0.0 --port 8000 --reload --log-level debug
+cd /workspace/sam3d-api
+bash install_conda_start_env_host_api.sh
 ```
 
-Simple run (no reload):
+This script:
+1. Reinstalls miniconda if missing (it lives on the container disk, not the volume — gone after "Terminate", kept after "Stop")
+2. Activates the `sam3d-objects` conda env
+3. Exports the runtime env vars the env needs (see [Known runtime quirks](#known-runtime-quirks) below)
+4. Copies checkpoints from the network volume to local container disk (`/root/sam3d-checkpoints`) once per pod — the worker then loads from fast local NVMe instead of the slower network volume
+5. Starts `uvicorn api:app --host 0.0.0.0 --port 8000` in the foreground
 
+Run it inside `tmux` if you want to detach and keep the API running after disconnecting:
 ```bash
-python api.py
-# or
-uvicorn api:app --host 0.0.0.0 --port 8000 --log-level info
+tmux new -s sam3d
+bash install_conda_start_env_host_api.sh
+# detach: Ctrl-b d   |   reattach: tmux attach -t sam3d
 ```
 
-### Launch with Uvicorn/Gunicorn (production)
-
-Run with multiple worker processes (recommended in production when you want process-level parallelism):
-
-Using Gunicorn + Uvicorn worker class:
-
-```bash
-gunicorn -k uvicorn.workers.UvicornWorker -w 4 -b 0.0.0.0:8000 api:app --log-level info
-```
-
-Or using Uvicorn's `--workers` flag directly:
-
-```bash
-uvicorn api:app --host 0.0.0.0 --port 8000 --workers 4 --log-level info
-```
-
-Notes & tips:
-
-- Use `--reload` only in development (it restarts the process on file changes).
-- Tune `--workers` (or Gunicorn `-w`) based on CPU and memory. If your workload is GPU-bound, avoid starting multiple processes that compete for the same GPU unless appropriately isolated.
-- Ensure `CUDA_VISIBLE_DEVICES` (or equivalent GPU pinning) is set for your production service manager (systemd, container, or supervisor). Also ensure the required `sam-3d-objects` folders and checkpoint file exist at `./sam-3d-objects/notebook` and `./sam-3d-objects/checkpoints/hf/pipeline.yaml`.
-- For long-running/production deployments, consider a process manager (systemd, docker-compose, k8s) and a reverse proxy (NGINX) for TLS, buffering, and routing.
-
-Visit the interactive docs: http://localhost:8000/docs
-
----
-
-## Endpoints & Examples 📡
-
-All requests that take images or masks expect base64-encoded PNG/JPEG payloads.
-
-### Health
-
-- GET `/health`
-
-Example:
-
+Verify it's up:
 ```bash
 curl http://localhost:8000/health
 ```
 
 ---
 
-### Segment (single point)
+## Repairing a broken env (without a full `setup.sh` rebuild)
 
-- POST `/segment`
-
-Body (JSON):
-
-```json
-{
-  "image": "<base64 PNG/JPEG>",
-  "x": 200,
-  "y": 150,
-  "multimask_output": true,
-  "mask_threshold": 0.0
-}
-```
-
-Response: JSON with `masks` (base64 PNGs), `scores`, and `image_shape`.
-
-cURL example (using jq for compact output):
+If a `pip install` mid-session pulled in an incompatible version (e.g. an unrelated package upgrading `numpy` or `torch` as a side effect), you don't need to rerun all of `setup.sh`. Reactivate the env and diagnose:
 
 ```bash
-curl -s -X POST http://localhost:8000/segment \
-  -H 'Content-Type: application/json' \
-  -d '{"image":"<BASE64>","x":200,"y":150}' | jq .
+source resume.sh
+```
+
+This activates the env, restores the base env vars, and prints the torch version. From there, common fixes:
+
+```bash
+# torch/numpy got dragged to the wrong version by an unrelated pip install
+pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
+    --index-url https://download.pytorch.org/whl/cu128 --force-reinstall --no-deps
+pip install numpy==1.26.4 --force-reinstall --no-deps
+pip install nvidia-cusparselt-cu12==0.6.3 --force-reinstall --no-deps
+
+# re-register sam3d_objects after any dependency reinstall
+cd /workspace/sam3d-api/sam-3d-objects
+pip install -e '.' --no-deps
+python -c "import sam3d_objects; print('sam3d OK')"
+```
+
+**Verify the full env in one shot** (separate `python -c` calls each pay the full torch-import cost again on network storage — combine into one process):
+
+```bash
+python -c "
+import torch; print('torch', torch.__version__, torch.cuda.is_available())
+import numpy; print('numpy', numpy.__version__)
+import kaolin, pytorch3d, nvdiffrast; print('native OK')
+import flash_attn; print('flash-attn', flash_attn.__version__)
+import xformers.ops; print('xformers OK')
+import sam3d_objects; print('sam3d OK')
+"
 ```
 
 ---
 
-### Segment Binary (multi-point, returns masked PNG)
+## Known runtime quirks
 
-- POST `/segment-binary`
+These are already handled by `install_conda_start_env_host_api.sh` (and `LIDRA_SKIP_INIT` is also set in-code by `api.py`/`worker_3d.py`) — listed here so manual `python -c` checks against the env don't hit surprise errors:
 
+| Symptom | Cause | Fix |
+|---|---|---|
+| `ModuleNotFoundError: No module named 'sam3d_objects.init'` | `init.py` isn't part of this distribution — only needed for heavyweight training paths, guarded by an env var | `export LIDRA_SKIP_INIT=true` |
+| `ImportError: Requires Flash-Attention version >=2.7.1,<=2.7.4 but got 2.8.3` on `import xformers.ops` | flash-attn 2.8.3 is the only prebuilt wheel available for sm_120/Blackwell; xformers 0.0.30 only tests against 2.7.x | `export XFORMERS_IGNORE_FLASH_VERSION_CHECK=1` — bypasses the version *check* only, the actual flash-attn bindings still load. Verified numerically compatible (see `runpod/docs/resume-schekclist-24_07.md` in the `MixedRealityInteriorArrangement` repo for the correctness test) |
+| `ModuleNotFoundError: No module named 'appdirs'` while building `nvidia-pyindex` | its `setup.py` needs `appdirs` even under `--no-build-isolation` | `pip install appdirs` first |
+| `numpy` silently downgraded/upgraded after installing `moge`/`utils3d` | those packages were installed without `--no-deps`, pulling their own numpy pin | re-pin per the repair snippet above |
+
+Also worth knowing: **`miniconda` (`/root/miniconda3`) lives on the container disk, not the network volume.** It survives a pod **Stop**, but not a **Terminate** — a Terminate needs `resume.sh`/`install_conda_start_env_host_api.sh` to reinstall it (automatic, no data loss — the conda env itself is on `/workspace` and survives).
+
+---
+
+## Backup
+
+Once the env is verified working, back it up so a future repair session doesn't need to repeat any of the above:
+
+```bash
+tar czvf /workspace/sam3d-backup-$(date +%d_%m).tar.gz \
+    -C / workspace/envs/sam3d-objects workspace/sam3d-api
+```
+
+**What's in the archive:**
+
+- `workspace/envs/sam3d-objects` — the complete conda env: Python interpreter + every installed package (torch, kaolin, pytorch3d, nvdiffrast, flash-attn, xformers, sam3d_objects and all transitive deps) exactly as verified working
+- `workspace/sam3d-api` — this repo as checked out on the pod, including `sam-3d-objects/checkpoints/hf` (the ~13.3 GB model checkpoints)
+
+**Not included:** `/root/miniconda3` (the conda installer itself — container disk, cheap to reinstall via `resume.sh`) and `/workspace/pip-cache` (throwaway download cache).
+
+**What it's for:** restoring a working env in minutes instead of re-running `setup.sh` (which means redoing every version pin/workaround in this README) — extract the two paths back under `/workspace` on a fresh pod of the **same GPU architecture** and skip straight to [Daily start](#daily-start-after-a-pod-stoprestart).
+
+Then copy it **off the volume** (RunPod egress is free) — a backup that lives only on the same volume doesn't protect against a volume-level problem.
+
+⚠️ The backup is **architecture-bound**: the native extensions (kaolin, pytorch3d, nvdiffrast, flash-attn, xformers) are compiled for the specific GPU's compute capability. Restorable only on the same architecture (e.g. sm_120/Blackwell) — on a different GPU, rebuild via `setup.sh` instead.
+
+---
+
+## API Reference
+
+Base URL: `http://<pod-ip>:8000` (or via RunPod's proxy URL).
+
+### `GET /health`
+```json
+{"status": "healthy", "model_loaded": true, "device": "cuda", "model": "facebook/sam2.1-hiera-large", "worker_ready": true}
+```
+`worker_ready: false` means the persistent 3D-generation worker (see below) is still loading its pipeline — segmentation (`/segment*`) works regardless, `/generate-3d` will wait for it.
+
+### `POST /segment` — single-point segmentation
 Body:
-
 ```json
-{
-  "image": "<base64 image>",
-  "points": [
-    { "x": 200, "y": 150 },
-    { "x": 220, "y": 170 }
-  ],
-  "previous_mask": "<optional base64 mask PNG>",
-  "mask_threshold": 0.0
-}
+{"image": "<base64 PNG/JPEG>", "x": 200, "y": 150, "multimask_output": true, "mask_threshold": 0.0}
 ```
+Returns `masks` (array of `{mask: base64 PNG, mask_shape, score}`), `input_point`, `image_shape`.
 
-Response: JSON containing `mask` (base64 PNG) and `score`.
-
----
-
-### Generate 3D (async)
-
-- POST `/generate-3d`
-
+### `POST /segment-binary` — multi-point, returns masked image
 Body:
+```json
+{"image": "<base64 image>", "points": [{"x": 200, "y": 150}, {"x": 220, "y": 170}], "previous_mask": "<optional base64 PNG>", "mask_threshold": 0.0}
+```
+Returns `{"mask": "<base64 PNG>", "score": 0.95}` — the source image with everything outside the mask blacked out.
 
+### `POST /generate-3d` — async 3D generation
+Body:
+```json
+{"image": "<base64 image>", "mask": "<base64 binary mask PNG>", "seed": 42}
+```
+Returns immediately: `{"task_id": "<uuid>", "status": "queued"}`. Generation runs in a **persistent worker process** (loads the Sam-3d-objects pipeline once at API startup, not per-request — see `worker_3d.py`), serialized one job at a time (single GPU).
+
+### `GET /generate-3d-status/{task_id}` — poll for the result
 ```json
 {
-  "image": "<base64 image>",
-  "mask": "<base64 binary mask PNG>",
-  "seed": 42
+  "task_id": "...",
+  "status": "queued | processing | completed | failed",
+  "progress": 0,
+  "mesh_url": "/assets/mesh_<id>.glb",
+  "mesh_format": "glb",
+  "mesh_size_bytes": 1234567,
+  "inference_seconds": 12.3
 }
 ```
+`mesh_url`/`mesh_format`/`mesh_size_bytes`/`inference_seconds` only present when `status == "completed"`; `error` present when `status == "failed"`. Download the mesh directly from `mesh_url` (served as a static file under `/assets`) — the API no longer embeds mesh bytes as base64 in the JSON response.
 
-Response: `{ "task_id": "<uuid>", "status": "queued" }` — poll `/generate-3d-status/{task_id}` for updates.
-
-Poll example:
-
-```bash
-curl http://localhost:8000/generate-3d-status/<task_id> | jq .
-```
-
-When completed, the status contains `output_b64` (PLY or GIF), `output_type` (`"ply"`/`"gif"`), `ply_url` (public `/assets/...` path), and `mesh_url` if a mesh or GLB was generated.
-
-### GLB export & mesh outputs
-
-The subprocess attempts to export a textured GLB (native or via `to_glb`) as the primary mesh output when available. Notes:
-
-- If GLB export succeeds, the `/generate-3d-status/{task_id}` response will include `mesh_url` (e.g. `/assets/mesh_<id>.glb`) and the API will also return `mesh_b64` and `mesh_size_bytes` when you poll the task status.
-- The GLB/mesh is saved in the `assets/` folder and is accessible at the `mesh_url` path exposed by the API.
-
-Example: download and save the mesh (server returns `mesh_b64`):
-
-```bash
-curl -s http://localhost:8000/generate-3d-status/<task_id> | jq -r '.mesh_b64' | base64 --decode > result.glb
-```
-
-Troubleshooting & tips for GLB/mesh export:
-
-- The subprocess prints detailed debug lines; check the subprocess stdout logs for markers such as `MESH_URL_START` / `MESH_URL_END`, `PLY_URL_START` / `PLY_URL_END`, or warnings about `to_glb()`.
-- If the pipeline returns unexpected structures (for example, `mesh` as a `list`), the subprocess will try to select a mesh-like element. If none is suitable, `to_glb()` will be skipped and a warning will be printed — the PLY or GIF output may still be available.
-- If `to_glb()` raises an AttributeError (for example, because an object in the list is not a mesh with `.vertices`), the subprocess now catches the error and continues; inspect the logs and the pipeline output to find and fix the root cause.
-- Native GLB export may require additional sam-3d-objects dependencies (texture baking, etc.) and can be GPU/CPU intensive.
-
----
-
----
-
-### Assets
-
-- GET `/assets-list` — lists files saved to the `assets/` folder with metadata.
-
----
-
-## Example Python client snippet 🧪
-
-```python
-import base64, requests
-
-# Read image and encode
-with open('input.jpg', 'rb') as f:
-    img_b64 = base64.b64encode(f.read()).decode('utf-8')
-
-resp = requests.post('http://localhost:8000/segment', json={
-    'image': img_b64,
-    'x': 200, 'y': 150
-})
-print(resp.json())
+### `GET /assets-list`
+```json
+{"files": [{"name": "mesh_x.glb", "size_bytes": 123, "url": "/assets/mesh_x.glb", "created_at": "..."}], "total_files": 1, "total_size_bytes": 123}
 ```
 
 ---
 
-## Troubleshooting & Tips 💡
+## Development notes
 
-- If models fail to load, ensure you authenticated with the Hugging Face CLI and downloaded checkpoints via `setup.sh`.
-- The 3D generation may require a GPU and substantial memory — the subprocess prints memory and timing info to stdout for debugging.
-- Install `open3d` if you want full mesh simplification (note: CPU intensive).
-- If you run into `spconv` tuning/float64 issues, ensure the env vars are set before importing `torch` (the code already sets them early).
-
-> ⚠️ Large PLY files may be written in ASCII/UTF-8 format by the post-processing step; validate that clients can handle large base64 payloads when polling for results.
-
----
-
-## Development Notes & Contribution 🔭
-
-- The heavy Sam-3d-objects logic is executed in `generate_3d_subprocess.py`; the API enqueues a background task which spawns that subprocess.
-- Keep subprocess isolation when experimenting with `spconv` and GPU settings.
-
-Contributions welcome — open issues or PRs with improvements, examples, and CI tests.
-
----
+- `api.py` — FastAPI app: SAM 2 segmentation endpoints, task queue for `/generate-3d`, spawns/manages the persistent worker.
+- `worker_3d.py` — long-lived subprocess, loads the Sam-3d-objects pipeline once and processes jobs from stdin as line-delimited JSON. Replaces the old per-request subprocess (`generate_3d_subprocess.py`, now unused by `api.py`) that reloaded all checkpoints on every request.
+- `setup.sh` — from-scratch env bootstrap, heavily commented with the *why* behind each pin/workaround; read it before changing dependency versions.
+- `resume.sh` — reactivate the env for manual repair work; does **not** start the API (that's `install_conda_start_env_host_api.sh`).
 
 ## License
 
