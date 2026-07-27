@@ -5,7 +5,7 @@ FastAPI service that runs on a RunPod GPU pod:
 1. **SAM 2** (Hugging Face `facebook/sam2.1-hiera-large`) — point-based image segmentation
 2. **Sam-3d-objects** (Meta, `facebook/sam-3d-objects`) — turns an image + mask into a textured 3D mesh (GLB)
 
-This README covers **setup and operating the pod**. For the API contract (endpoints, request/response shapes) see [API Reference](#api-reference) below. The original, more narrative README is kept at [`README-old.md`](README-old.md).
+This README covers **setup and operating the pod**. For the API contract (endpoints, request/response shapes) see [API Reference](#api-reference) below.
 
 Everything here targets a RunPod pod with a **Network Volume mounted at `/workspace`** — that's where the conda env, the repo, and the model checkpoints live so they survive a pod stop/restart. Scripts assume the repo is checked out at `/workspace/sam3d-api`.
 
@@ -256,7 +256,7 @@ Returns immediately: `{"task_id": "<uuid>", "status": "queued"}`. Generation run
 ## Development notes
 
 - `api.py` — FastAPI app: SAM 2 segmentation endpoints, task queue for `/generate-3d`, spawns/manages the persistent worker.
-- `worker_3d.py` — long-lived subprocess, loads the Sam-3d-objects pipeline once and processes jobs from stdin as line-delimited JSON. Replaces the old per-request subprocess (`generate_3d_subprocess.py`, now unused by `api.py`) that reloaded all checkpoints on every request.
+- `worker_3d.py` — long-lived subprocess, loads the Sam-3d-objects pipeline once and processes jobs from stdin as line-delimited JSON. Replaces the old per-request subprocess (`generate_3d_subprocess.py`, removed) that reloaded all checkpoints on every request.
 - `setup.sh` — from-scratch env bootstrap, heavily commented with the *why* behind each pin/workaround; read it before changing dependency versions.
 - `resume.sh` — reactivate the env for manual repair work; does **not** start the API (that's `install_conda_start_env_host_api.sh`).
 

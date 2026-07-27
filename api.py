@@ -57,7 +57,7 @@ import uuid
 from typing import List, Dict, Optional
 from PIL import Image
 from fastapi import FastAPI, BackgroundTasks
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
@@ -631,20 +631,10 @@ async def generate_3d(request: Generate3dRequest, background_tasks: BackgroundTa
                 image_temp_path = tmp.name
                 tmp.write(image_bytes)
 
-            # Save for debugging
-            image_pil_save = Image.open(image_temp_path).convert("RGB")
-            image_pil_save.save("./test_img.png")
-            print(f"✓ Saved incoming image as test_img.png")
-
             mask_bytes = base64.b64decode(request.mask)
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
                 mask_temp_path = tmp.name
                 tmp.write(mask_bytes)
-
-            # Save for debugging
-            mask_pil_save = Image.open(mask_temp_path).convert("L")
-            mask_pil_save.save("./test_img_mask.png")
-            print(f"✓ Saved incoming mask as test_img_mask.png")
 
         except Exception as e:
             return JSONResponse(
@@ -759,7 +749,6 @@ async def list_assets():
     total_size = 0
 
     try:
-        import json
         from datetime import datetime
 
         for filename in os.listdir(ASSETS_DIR):
