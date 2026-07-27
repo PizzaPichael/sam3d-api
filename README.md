@@ -52,11 +52,15 @@ This script:
 3. Activates the `sam3d-objects` conda env
 4. Exports the runtime env vars the env needs (see [Known runtime quirks](#known-runtime-quirks) below)
 5. Copies checkpoints from the network volume to local container disk (`/root/sam3d-checkpoints`) once per pod — the worker then loads from fast local NVMe instead of the slower network volume
-6. Starts `uvicorn api:app --host 0.0.0.0 --port 8000` in the foreground, with a background monitor that logs progress (memory growth + `/health` polling) every 20s until the API responds — the import chain below can take 10-20+ min on first read, this makes that visible instead of a silent wait
+6. Starts the API via `$PYTHON_BIN -m uvicorn api:app --host 0.0.0.0 --port 8000` in the foreground (see below for what `$PYTHON_BIN` is), with a background monitor that logs progress (memory growth + `/health` polling) every 20s until the API responds — the import chain below can take 10-20+ min on first read, this makes that visible instead of a silent wait
 
-**Why the env gets mirrored:** `torch`/`kaolin`/`pytorch3d`/`nvdiffrast`/`flash-attn`/`xformers`/`sam3d_objects` are read off `/workspace` — a network volume (MooseFS/FUSE) — on every single import, every pod start. That's what makes `api.py`'s startup imports take 10-20+ min. The script copies the whole env to local NVMe once and bind-mounts it back over the original path, so conda metadata and shebangs (which hardcode `/workspace/envs/sam3d-objects`) keep working unchanged — only the storage backing that path switches from network to local.
+**Why the env gets mirrored:** `torch`/`kaolin`/`pytorch3d`/`nvdiffrast`/`flash-attn`/`xformers`/`sam3d_objects` are read off `/workspace` — a network volume (MooseFS/FUSE) — on every single import, every pod start. That's what makes the startup imports take 10-20+ min. The script copies the whole env to local NVMe once (`/root/sam3d-env-local`).
 
-This needs `CAP_SYS_ADMIN` for `mount --bind`, which the container may not grant (RunPod pods have refused comparable low-level operations before, e.g. `ptrace` for `py-spy`). If the mount is refused, the script logs a note and continues running from the network volume as before — no new failure mode, just no speedup.
+**Two ways the mirror actually gets used, tried in this order:**
+1. **`mount --bind`** the local mirror over the original `/workspace/envs/sam3d-objects` path — conda metadata and shebangs (which hardcode that path) keep working completely unchanged, only the storage backing it switches from network to local. Needs `CAP_SYS_ADMIN`, which RunPod containers have refused so far in practice (same class of restriction that blocks `py-spy`'s ptrace).
+2. **If the mount is refused:** fall back to invoking the mirror's own python binary directly (`$LOCAL_ENV_MIRROR/bin/python -m uvicorn ...`) instead of going through `/workspace/envs/sam3d-objects/bin/python`. Confirmed working in practice — the interpreter resolves its own site-packages fine without needing the original path. This is what `$PYTHON_BIN` in step 6 refers to. Since `api.py` spawns the 3D worker via `sys.executable`, the worker subprocess automatically inherits whichever interpreter actually started `uvicorn` — so the speedup covers the worker's (heavier) import chain too, not just the main API process.
+
+Either way, once the mirror exists the imports run off local disk — no case left where the copy goes to waste.
 
 Run it inside `tmux` if you want to detach and keep the API running after disconnecting:
 ```bash
@@ -69,6 +73,48 @@ Verify it's up:
 ```bash
 curl http://localhost:8000/health
 ```
+
+### Progress bars
+
+Both the checkpoint copy and the env mirror (step 2 above) print a live percent bar while they run:
+```
+Mirroring conda env to local disk (/root/sam3d-env-local) for faster imports on future starts — one-time, can take a while...
+0%..........10%..........20%..........30%..........40%..........50%..........60%..........70%..........80%..........90%..........100% (7m42s)
+```
+It's produced by polling the destination's size against the source's total size every 10s (`copy_with_progress` in the script) — both directories live on the same slow `/workspace` network volume, so plain `cp` gave zero output otherwise. The elapsed time printed at the end is kept on screen so you can see how long the copy actually took.
+
+### Diagnosing a stuck copy or a stuck startup
+
+If a progress bar (or the `[startup-monitor]` output once `uvicorn` starts) stops advancing for several minutes, check whether it's actually stuck or just slow — `/workspace` is a FUSE-backed network volume (MooseFS), so near-zero CPU and no visible output are *normal* while it's reading, not proof of a hang.
+
+**Find the process** (matches multiple keywords via basic regex alternation):
+```bash
+pgrep -fa "cp -a|cp -r|uvicorn|worker_3d"
+```
+
+**Live CPU/mem for a specific PID:**
+```bash
+top -p <PID>
+```
+
+**Sleeping vs. genuinely stuck** — check kernel wait-channel and memory:
+```bash
+cat /proc/<PID>/status | grep -E "State|VmRSS"
+cat /proc/<PID>/wchan; echo
+```
+`wchan: request_wait_answer` means it's blocked on a FUSE request (i.e. `/workspace` I/O) — expected while copying/importing, not a deadlock by itself.
+
+**For a copy specifically** — exact byte count, since `du -sh` rounds and can look unchanged between checks on a multi-GB copy:
+```bash
+du -sb <destination-dir>
+# wait ~30-60s
+du -sb <destination-dir>
+```
+Growing → still copying, just slow. Identical twice in a row → check which file it's stuck on:
+```bash
+ls -l /proc/<PID>/fd
+```
+Run that twice a bit apart — same source file open both times points at one specific file being the bottleneck (or a genuine hang), not general slowness.
 
 ---
 

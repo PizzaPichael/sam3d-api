@@ -71,19 +71,6 @@ from transformers import Sam2Processor, Sam2Model
 # ============================================================================
 torch.set_default_dtype(torch.float32)
 
-# Sam-3d-objects imports (optional - gracefully fail if not available)
-try:
-    sam3d_notebook_path = "./sam-3d-objects/notebook"
-    if os.path.exists(sam3d_notebook_path):
-        sys.path.insert(0, sam3d_notebook_path)
-        from inference import Inference
-
-        print(f"✓ Sam-3d-objects imported successfully")
-    else:
-        print(f"⚠ Sam-3d-objects notebook path not found at {sam3d_notebook_path}")
-except Exception as e:
-    print(f"⚠ Sam-3d-objects import failed: {e}")
-
 # Configure device
 os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
 

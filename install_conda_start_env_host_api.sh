@@ -3,6 +3,63 @@ set -e
 
 ENV_PATH=/workspace/envs/sam3d-objects
 
+# Copies src -> dst in the background while printing a percent bar (0%....10%....20%...)
+# by polling the destination's size against the source's total size. Plain 'cp' gives zero
+# output — on the slow /workspace FUSE volume that's indistinguishable from a hang (see
+# README "Diagnosing a stuck copy"). Used for both the checkpoint copy and the env mirror
+# below, since both read from the same slow network volume.
+copy_with_progress() {
+    local src="$1" dst="$2"
+    local total_bytes current_bytes percent last_percent step=2 pid status start_ts elapsed
+
+    start_ts=$(date +%s)
+    mkdir -p "$dst"
+    total_bytes=$(du -sb "$src" 2>/dev/null | cut -f1)
+    if [ -z "$total_bytes" ] || [ "$total_bytes" -eq 0 ]; then
+        total_bytes=1
+    fi
+
+    cp -a "$src/." "$dst/" &
+    pid=$!
+
+    printf "0%%"
+    last_percent=0
+    while kill -0 "$pid" 2>/dev/null; do
+        sleep 10
+        current_bytes=$(du -sb "$dst" 2>/dev/null | cut -f1)
+        [ -z "$current_bytes" ] && current_bytes=0
+        percent=$(( current_bytes * 100 / total_bytes ))
+        [ "$percent" -gt 99 ] && percent=99   # cp still running -> never show 100 early
+        while [ "$last_percent" -lt "$percent" ]; do
+            last_percent=$(( last_percent + step ))
+            if [ $(( last_percent % 10 )) -eq 0 ]; then
+                printf "%d%%" "$last_percent"
+            else
+                printf "."
+            fi
+        done
+    done
+    if wait "$pid"; then
+        status=0
+    else
+        status=$?
+    fi
+    while [ "$last_percent" -lt 100 ]; do
+        last_percent=$(( last_percent + step ))
+        if [ "$last_percent" -ge 100 ]; then
+            last_percent=100
+            printf "100%%"
+        elif [ $(( last_percent % 10 )) -eq 0 ]; then
+            printf "%d%%" "$last_percent"
+        else
+            printf "."
+        fi
+    done
+    elapsed=$(( $(date +%s) - start_ts ))
+    printf " (%dm%02ds)\n" "$(( elapsed / 60 ))" "$(( elapsed % 60 ))"
+    return "$status"
+}
+
 # Miniconda neu installieren falls nicht vorhanden.
 # Auf das Binary pruefen, nicht auf das Verzeichnis: ein leeres /root/miniconda3
 # (z.B. nach abgebrochener Installation) wuerde einen -d Test bestehen.
@@ -23,21 +80,25 @@ export CONDA_ENVS_PATH=/workspace/envs
 # 10-20+ min on every pod start (see README "Known runtime quirks") — env files get read
 # fresh from the network volume every time otherwise.
 #
-# Requires CAP_SYS_ADMIN for 'mount --bind', which this container may not have (same class
-# of restriction that blocks py-spy's ptrace). Falls back to running from the network
-# volume unchanged if the mount isn't permitted — no new failure mode either way.
+# Requires CAP_SYS_ADMIN for 'mount --bind', which RunPod containers have refused so far
+# (same class of restriction that blocks py-spy's ptrace). If the mount isn't permitted,
+# fall back to invoking the local mirror's python directly (confirmed working — its own
+# prefix resolution doesn't depend on the bind-mount trick) instead of via the network path.
 LOCAL_ENV_MIRROR=/root/sam3d-env-local
-if ! mountpoint -q "$ENV_PATH" 2>/dev/null; then
+BIND_MOUNTED=0
+if mountpoint -q "$ENV_PATH" 2>/dev/null; then
+    BIND_MOUNTED=1
+else
     if [ ! -x "$LOCAL_ENV_MIRROR/bin/python" ]; then
         echo "Mirroring conda env to local disk ($LOCAL_ENV_MIRROR) for faster imports on future starts — one-time, can take a while..."
-        mkdir -p "$LOCAL_ENV_MIRROR"
-        cp -a "$ENV_PATH/." "$LOCAL_ENV_MIRROR/"
+        copy_with_progress "$ENV_PATH" "$LOCAL_ENV_MIRROR"
         echo "Env mirror done."
     fi
     if mount --bind "$LOCAL_ENV_MIRROR" "$ENV_PATH" 2>/dev/null; then
         echo "Conda env now served from local disk (bind-mounted over $ENV_PATH)."
+        BIND_MOUNTED=1
     else
-        echo "NOTE: bind-mount not permitted in this container — running from the network volume as before (no speedup, nothing broken)."
+        echo "NOTE: bind-mount not permitted in this container — will invoke the local env mirror directly instead."
     fi
 fi
 
@@ -71,11 +132,21 @@ fi
 LOCAL_CKPT=/root/sam3d-checkpoints
 if [ ! -f "$LOCAL_CKPT/hf/pipeline.yaml" ]; then
     echo "Copying checkpoints to local disk ($LOCAL_CKPT)..."
-    mkdir -p "$LOCAL_CKPT"
-    cp -r /workspace/sam3d-api/sam-3d-objects/checkpoints/. "$LOCAL_CKPT/"
+    copy_with_progress /workspace/sam3d-api/sam-3d-objects/checkpoints "$LOCAL_CKPT"
     echo "Checkpoint copy done."
 fi
 export SAM3D_CHECKPOINT_DIR="$LOCAL_CKPT"
+
+# Which python actually runs uvicorn (and, via sys.executable, the worker_3d.py subprocess
+# api.py spawns): the network path if it's bind-mounted to local disk (or genuinely on
+# network storage), otherwise the local mirror directly — bypassing the failed bind-mount
+# still gets the speedup, since the mirror's own python resolves its prefix independently.
+if [ "$BIND_MOUNTED" -eq 1 ] || [ ! -x "$LOCAL_ENV_MIRROR/bin/python" ]; then
+    PYTHON_BIN="$ENV_PATH/bin/python"
+else
+    PYTHON_BIN="$LOCAL_ENV_MIRROR/bin/python"
+    echo "Using local env mirror directly (no bind-mount) for faster imports: $PYTHON_BIN"
+fi
 
 cd /workspace/sam3d-api
 
@@ -103,4 +174,4 @@ cd /workspace/sam3d-api
 monitor_pid=$!
 trap 'kill $monitor_pid 2>/dev/null' EXIT
 
-uvicorn api:app --host 0.0.0.0 --port 8000
+"$PYTHON_BIN" -m uvicorn api:app --host 0.0.0.0 --port 8000
