@@ -140,10 +140,10 @@ cd /workspace/sam3d-api/sam-3d-objects
 pip install -e '.' --no-deps
 python -c "import sam3d_objects; print('sam3d OK')"
 
-# '--no-deps' above skips omegaconf too — sam-3d-objects/notebook/inference.py imports it
-# directly, so the worker crashes on the first job otherwise (ModuleNotFoundError, not caught
-# until you actually try a /generate-3d call)
-pip install omegaconf
+# '--no-deps' above skips omegaconf and hydra too — sam-3d-objects/notebook/inference.py
+# imports both directly, so the worker crashes on the first job otherwise (ModuleNotFoundError,
+# not caught until you actually try a /generate-3d call)
+pip install omegaconf hydra-core
 ```
 
 **Verify the full env in one shot** (separate `python -c` calls each pay the full torch-import cost again on network storage — combine into one process):
@@ -171,7 +171,7 @@ These are already handled by `install_conda_start_env_host_api.sh` (and `LIDRA_S
 | `ImportError: Requires Flash-Attention version >=2.7.1,<=2.7.4 but got 2.8.3` on `import xformers.ops` | flash-attn 2.8.3 is the only prebuilt wheel available for sm_120/Blackwell; xformers 0.0.30 only tests against 2.7.x | `export XFORMERS_IGNORE_FLASH_VERSION_CHECK=1` — bypasses the version *check* only, the actual flash-attn bindings still load. Verified numerically compatible (see `runpod/docs/resume-schekclist-24_07.md` in the `MixedRealityInteriorArrangement` repo for the correctness test) |
 | `ModuleNotFoundError: No module named 'appdirs'` while building `nvidia-pyindex` | its `setup.py` needs `appdirs` even under `--no-build-isolation` | `pip install appdirs` first |
 | `numpy` silently downgraded/upgraded after installing `moge`/`utils3d` | those packages were installed without `--no-deps`, pulling their own numpy pin | re-pin per the repair snippet above |
-| `[API] 3D worker exited` right after startup, worker log shows `ModuleNotFoundError: No module named 'omegaconf'` | `sam-3d-objects/notebook/inference.py` imports `omegaconf` directly; re-registering `sam3d_objects` via `-e '.' --no-deps` (repair path) skips it | `pip install omegaconf` — `setup.sh` now installs it explicitly too, so a fresh setup shouldn't hit this |
+| `[API] 3D worker exited` right after startup, worker log shows `ModuleNotFoundError: No module named 'omegaconf'` (or `'hydra'`) | `sam-3d-objects/notebook/inference.py` imports both `omegaconf` and `hydra` directly; re-registering `sam3d_objects` via `-e '.' --no-deps` (repair path) skips them | `pip install omegaconf hydra-core` — `setup.sh` now installs both explicitly too, so a fresh setup shouldn't hit this |
 
 Also worth knowing: **`miniconda` (`/root/miniconda3`) lives on the container disk, not the network volume.** It survives a pod **Stop**, but not a **Terminate** — a Terminate needs `resume.sh`/`install_conda_start_env_host_api.sh` to reinstall it (automatic, no data loss — the conda env itself is on `/workspace` and survives).
 
