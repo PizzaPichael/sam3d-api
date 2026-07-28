@@ -478,6 +478,100 @@ pip install omegaconf hydra-core
 
 ---
 
+### 20. `no kernel image` aus xformers' Hopper-Kerneln auf sm_120
+
+**Symptom:** Setup und Pipeline-Load laufen sauber durch, `[API] ✓ 3D worker ready` kommt —
+aber der erste `/generate-3d`-Call killt den Worker mitten in `pipe.run()`:
+
+```
+sam3d_objects.pipeline.inference_pipeline:get_condition_input:633 - Running condition embedder ...
+CUDA error (/__w/xformers/xformers/third_party/flash-attention/hopper/flash_fwd_launch_template.h:175):
+no kernel image is available for execution on the device
+[API] 3D worker exited (returncode=None)
+```
+
+**Ursache:** Der Condition-Embedder ist DINOv2. Dessen Attention nutzt
+`xformers.ops.memory_efficient_attention`, und xformers 0.0.30 dispatcht das in seine
+mitgelieferten **FlashAttention-3-Kernel**. Die sind ausschliesslich fuer **sm_90/Hopper**
+gebaut — auf sm_120/Blackwell existiert kein passendes Kernel-Image.
+
+Neu bauen hilft nicht: FA3 ist architekturbedingt Hopper-only. Eine andere xformers-Version
+auch nicht (siehe Punkt 16 — nur 0.0.30 passt zu torch 2.7.0).
+
+**Fix:** DINOv2 diesen Pfad gar nicht nehmen lassen. `dinov2/layers/attention.py` und
+`swiglu_ffn.py` werten eine eigene Variable aus:
+
+```python
+XFORMERS_ENABLED = os.environ.get("XFORMERS_DISABLED") is None
+```
+
+Also:
+
+```bash
+export XFORMERS_DISABLED=1
+```
+
+Beide Module fallen dann auf ihre reinen PyTorch-Implementierungen zurueck. Steht in
+`install_conda_start_env_host_api.sh` und im Verifikationsblock von `setup.sh` Step 11.
+
+**Nicht verwechseln mit Punkt 4/16:** dort ging es darum, dass xformers seine Extensions
+ueberhaupt *laedt* (Import-Zeit). Hier laedt alles korrekt, nur das ausgefuehrte Kernel
+passt nicht zur GPU. `XFORMERS_IGNORE_FLASH_VERSION_CHECK=1` bleibt deshalb zusaetzlich
+gesetzt.
+
+**Kosten:** DINOv2 rechnet Attention in Standard-PyTorch statt memory-efficient. Bei ViT-L
+auf 518 px vernachlaessigbar gegen die 12 Diffusion-Steps.
+
+---
+
+### 21. Laufzeit-Pakete fehlen — Worker stirbt erst beim ersten Job
+
+**Symptom:** Kette von `ModuleNotFoundError` beim Worker-Start, jeweils ein Paket pro
+Neustart: `loguru`, danach `timm`, danach `open3d`, ... (vorher schon `omegaconf`/`hydra`,
+Punkt 19).
+
+**Ursache:** `setup.sh` Step 5 installierte die Inferenz-Deps handverlesen.
+`requirements.inference.txt` enthaelt nur vier Pakete (kaolin, gsplat, seaborn, gradio) —
+alles Weitere zieht der Pipeline-Code direkt, ohne dass es dort deklariert waere.
+
+**Die Paket-Metadaten sind als Quelle unbrauchbar:** `pip check` meldet ~77 fehlende
+Pakete, weil `hatch-requirements-txt` die grosse `requirements.txt` in die Metadaten
+uebernimmt — inklusive komplettem Trainings-/Dev-Stack (`wandb`, `tensorboard`, `jupyter`,
+`sagemaker`, `bpy`, `bitsandbytes`, `lightning`, ...). Davon braucht der Inferenz-Pfad fast
+nichts. Diese Meldungen ignorieren.
+
+**Ermittlung der echten Liste:** `notebook/inference.py` so lange importieren, bis kein
+`ModuleNotFoundError` mehr kommt. `CONDA_PREFIX` muss dabei gesetzt sein — `inference.py`
+Zeile 5 liest sie unbedingt und wirft sonst `KeyError`, was wie „keine fehlenden Module"
+aussieht.
+
+```bash
+export CONDA_PREFIX=/root/sam3d-env-local LIDRA_SKIP_INIT=true XFORMERS_DISABLED=1
+export PIP_CONSTRAINT=/root/torch-constraint.txt   # sonst zieht ein Dep torch 2.11 nach
+for i in $(seq 1 30); do out=$(python -c "import sys; sys.path.insert(0,'/workspace/sam3d-api/sam-3d-objects/notebook'); import inference" 2>&1); m=$(echo "$out" | grep -oP "No module named '\K[^']+" | head -1); if [ -z "$m" ]; then echo "=== ENDE ==="; echo "$out" | tail -5; break; fi; echo ">>> fehlt: $m"; pip install -q "${m//_/-}"; done
+```
+
+**Ergebnis (Stand 28.07.2026), jetzt fest in `setup.sh` Step 5:**
+
+```bash
+pip install loguru timm open3d optree astor easydict lightning xatlas pyvista pymeshfix igraph imageio
+```
+
+`gsplat` tauchte in derselben Schleife auf und wurde dabei versehentlich von PyPI
+installiert statt aus dem gepinnten Commit — beim Nachziehen unbedingt die git-Variante aus
+Step 5/9 verwenden, sonst laeuft eine nicht fuer sm_120 gebaute Version.
+
+**Versions-Drift:** Die Pakete kommen in aktuellen Versionen (timm 1.0.28, open3d 0.19.0,
+lightning 2.6.5), Meta pinnt aeltere (0.9.16 / 0.18.0 / 2.3.3). Mit den neuen laeuft ein
+vollstaendiger `/generate-3d` durch (verifiziert). Bei `TypeError`/`AttributeError` aus
+einem dieser Pakete gezielt auf den Meta-Pin zurueckgehen.
+
+**Fix in `setup.sh` (Step 11):** die Verifikation importiert jetzt `notebook/inference.py`
+statt nur `sam3d_objects` — genau der Pfad, den `worker_3d.py:132` nimmt. Damit faellt so
+ein fehlendes Paket am Ende des Setups auf statt beim ersten `/generate-3d`.
+
+---
+
 ## Finale Reihenfolge in setup.sh (kritische Steps)
 
 ```

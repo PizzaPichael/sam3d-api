@@ -20,7 +20,69 @@ Everything here targets a RunPod pod with a **Network Volume mounted at `/worksp
 
 ---
 
-## First-time setup (fresh pod / empty volume)
+## Bringing up a fresh pod — two paths
+
+| Situation | Path | Time |
+|---|---|---|
+| You have an env snapshot from a pod of the **same GPU architecture** | [Restore from snapshot](#option-a-restore-from-an-env-snapshot-fast) | ~5 min + checkpoint download |
+| No snapshot, or a different GPU architecture | [Build from scratch](#option-b-build-from-scratch-with-setupsh) | 15-30 min + all the debugging in `docs/setup-fixes.md` if anything drifted |
+
+Both assume a Network Volume mounted at `/workspace` and the repo at `/workspace/sam3d-api`.
+
+---
+
+## Option A: restore from an env snapshot (fast)
+
+Skips `setup.sh` entirely. Requires a snapshot built on the **same compute capability** — see [Backup](#backup) for how one is created and where it's stored.
+
+The env is an *editable* install: `sam3d_objects` resolves to `/workspace/sam3d-api/sam-3d-objects`, and the worker loads `notebook/inference.py` from there at runtime. Those source trees must exist at exactly those paths or the restored env is useless — so clone first, restore second.
+
+```bash
+# 1. Repos
+cd /workspace
+git clone <this-repo-url> sam3d-api
+cd sam3d-api
+git clone https://github.com/facebookresearch/sam-3d-objects.git
+
+# 2. HF CLI in the container's system python (throwaway, just to pull the artifacts)
+pip install 'huggingface-hub[cli]<1.0' hf_transfer
+export HF_HOME=/workspace/hf-home HF_HUB_ENABLE_HF_TRANSFER=1
+huggingface-cli login
+
+# 3. Env snapshot -> /workspace/env-snapshot.tzst (~4.6 GB)
+huggingface-cli download --repo-type=model --local-dir /workspace <user>/sam3d-env-sm120 env-snapshot.tzst
+
+# 4. Checkpoints (~13 GB)
+cd /workspace/sam3d-api/sam-3d-objects
+huggingface-cli download --repo-type=model --local-dir checkpoints/hf-download --max-workers 4 facebook/sam-3d-objects
+mv checkpoints/hf-download/checkpoints checkpoints/hf && rm -rf checkpoints/hf-download
+```
+
+Step 3 puts the file at `/workspace/env-snapshot.tzst` — exactly where `install_conda_start_env_host_api.sh` looks for it. If your copy lives on your own machine instead, `runpodctl send` it from there and move it to that path.
+
+`mv` in step 4 moves *into* the target when `checkpoints/hf` already exists, producing a nested duplicate — verify with `du -sh checkpoints/hf` (expect ~13 GB, not 25).
+
+Then the normal start:
+
+```bash
+cd /workspace/sam3d-api
+bash install_conda_start_env_host_api.sh
+```
+
+It finds the snapshot, restores the env to local disk in ~23s, and starts the API.
+
+The conda env under `/workspace/envs/sam3d-objects` is **not** recreated by this path — only the local mirror exists. The start script detects that and runs straight from the mirror (`NOTE: kein Env auf dem Volume`). That is enough to serve requests, but `resume.sh` — which activates the volume env for repair work — needs it. To get it back without re-running `setup.sh`:
+
+```bash
+mkdir -p /workspace/envs/sam3d-objects
+zstd -dc /workspace/env-snapshot.tzst | tar -C /workspace/envs/sam3d-objects -xf -
+```
+
+Slow (~150k small files onto MooseFS, tens of minutes) — only worth it if you expect to do repair work on this pod.
+
+---
+
+## Option B: build from scratch with `setup.sh`
 
 ```bash
 cd /workspace
@@ -37,6 +99,8 @@ source setup.sh
 
 Runs inside `tmux` automatically. If it drops: `tmux attach -t setup`.
 
+Once it's done and a `/generate-3d` call has succeeded, **create an env snapshot** — that is what turns every future pod start into Option A and cuts the env mirror from 74m42s to ~23s. See [Backup](#backup).
+
 ---
 
 ## Daily start (after a pod stop/restart)
@@ -48,17 +112,35 @@ bash install_conda_start_env_host_api.sh
 
 This script:
 1. Reinstalls miniconda if missing (it lives on the container disk, not the volume — gone after "Terminate", kept after "Stop")
-2. Mirrors the conda env itself to local container disk and bind-mounts it over the original `/workspace/envs/sam3d-objects` path (once per pod) — see below
+2. Restores the conda env to local container disk from `/workspace/env-snapshot.tzst` and bind-mounts it over the original `/workspace/envs/sam3d-objects` path (once per pod) — see below
 3. Activates the `sam3d-objects` conda env
 4. Exports the runtime env vars the env needs (see [Known runtime quirks](#known-runtime-quirks) below)
-5. Copies checkpoints from the network volume to local container disk (`/root/sam3d-checkpoints`) once per pod — the worker then loads from fast local NVMe instead of the slower network volume
-6. Starts the API via `$PYTHON_BIN -m uvicorn api:app --host 0.0.0.0 --port 8000` in the foreground (see below for what `$PYTHON_BIN` is), with a background monitor that logs progress (memory growth + `/health` polling) every 20s until the API responds — the import chain below can take 10-20+ min on first read, this makes that visible instead of a silent wait
+5. Points `SAM3D_CHECKPOINT_DIR` at the checkpoints on the volume — they are **not** copied to local disk (measured: pipeline loads in ~81s straight off the volume; a copy costs more than it saves, see [`docs/env-snapshot-plan.md`](docs/env-snapshot-plan.md))
+6. Starts the API via `$PYTHON_BIN -m uvicorn api:app --host 0.0.0.0 --port 8000` in the foreground (see below for what `$PYTHON_BIN` is), with a background monitor that logs progress (memory growth + `/health` polling) every 20s until the API responds
 
-**Why the env gets mirrored:** `torch`/`kaolin`/`pytorch3d`/`nvdiffrast`/`flash-attn`/`xformers`/`sam3d_objects` are read off `/workspace` — a network volume (MooseFS/FUSE) — on every single import, every pod start. That's what makes the startup imports take 10-20+ min. The script copies the whole env to local NVMe once (`/root/sam3d-env-local`).
+**Why the env gets mirrored:** `torch`/`kaolin`/`pytorch3d`/`nvdiffrast`/`flash-attn`/`xformers`/`sam3d_objects` are read off `/workspace` — a network volume (MooseFS/FUSE) — on every single import, every pod start. That's what makes the startup imports take 10-20+ min. The script puts the whole env on local NVMe once per pod (`/root/sam3d-env-local`).
+
+**Why from a snapshot and not a plain copy:** the env has ~150k files and `cp -a` pays a FUSE round-trip per file — measured at **74m42s**. Extracting one sequential 4.6 GB archive instead takes **22.5s**. The script falls back to the file-by-file copy when no snapshot exists.
+
+⚠️ **The snapshot must be rebuilt after every change to the env** (repair session, new package), otherwise the next pod start silently restores the old state:
+
+```bash
+printf '*.a\n./include\n./share/doc\n./share/man\n./pkgs\n' > /root/snap-exclude.txt
+tar -C /root/sam3d-env-local -X /root/snap-exclude.txt -cf - . | zstd -T0 -3 -o /workspace/env-snapshot.tzst
+```
+
+Keep it on one line — a paste that breaks mid-command leaves `tar` without a source and writes a **13-byte archive** that the next start would accept as a valid snapshot.
 
 **Two ways the mirror actually gets used, tried in this order:**
 1. **`mount --bind`** the local mirror over the original `/workspace/envs/sam3d-objects` path — conda metadata and shebangs (which hardcode that path) keep working completely unchanged, only the storage backing it switches from network to local. Needs `CAP_SYS_ADMIN`, which RunPod containers have refused so far in practice (same class of restriction that blocks `py-spy`'s ptrace).
 2. **If the mount is refused:** fall back to invoking the mirror's own python binary directly (`$LOCAL_ENV_MIRROR/bin/python -m uvicorn ...`) instead of going through `/workspace/envs/sam3d-objects/bin/python`. Confirmed working in practice — the interpreter resolves its own site-packages fine without needing the original path. This is what `$PYTHON_BIN` in step 6 refers to. Since `api.py` spawns the 3D worker via `sys.executable`, the worker subprocess automatically inherits whichever interpreter actually started `uvicorn` — so the speedup covers the worker's (heavier) import chain too, not just the main API process.
+
+⚠️ **Only `bin/python` resolves its own prefix.** Every other console script in the mirror's `bin/` (`huggingface-cli`, `uvicorn`, `pip`, …) carries a hardcoded `#!/workspace/envs/sam3d-objects/bin/python` shebang, so running it silently executes off the network volume — and fails outright on a restore-only pod that has no volume env at all. Always go through the module:
+
+```bash
+/root/sam3d-env-local/bin/python -m huggingface_hub.commands.huggingface_cli whoami   # not bin/huggingface-cli
+/root/sam3d-env-local/bin/python -m pip install ...                                   # not bin/pip
+```
 
 Either way, once the mirror exists the imports run off local disk — no case left where the copy goes to waste.
 
@@ -76,7 +158,7 @@ curl http://localhost:8000/health
 
 ### Progress bars
 
-Both the checkpoint copy and the env mirror (step 2 above) print a live percent bar while they run:
+The env-mirror **fallback** copy (step 2 above, only when no snapshot exists) prints a live percent bar while it runs:
 ```
 Mirroring conda env to local disk (/root/sam3d-env-local) for faster imports on future starts — one-time, can take a while...
 0%..........10%..........20%..........30%..........40%..........50%..........60%..........70%..........80%..........90%..........100% (7m42s)
@@ -169,6 +251,7 @@ These are already handled by `install_conda_start_env_host_api.sh` (and `LIDRA_S
 |---|---|---|
 | `ModuleNotFoundError: No module named 'sam3d_objects.init'` | `init.py` isn't part of this distribution — only needed for heavyweight training paths, guarded by an env var | `export LIDRA_SKIP_INIT=true` |
 | `ImportError: Requires Flash-Attention version >=2.7.1,<=2.7.4 but got 2.8.3` on `import xformers.ops` | flash-attn 2.8.3 is the only prebuilt wheel available for sm_120/Blackwell; xformers 0.0.30 only tests against 2.7.x | `export XFORMERS_IGNORE_FLASH_VERSION_CHECK=1` — bypasses the version *check* only, the actual flash-attn bindings still load. Verified numerically compatible (see `runpod/docs/resume-schekclist-24_07.md` in the `MixedRealityInteriorArrangement` repo for the correctness test) |
+| `CUDA error (.../xformers/third_party/flash-attention/hopper/...): no kernel image is available for execution on the device` — worker dies mid-`pipe.run()` on the first `/generate-3d` | DINOv2's attention dispatches into xformers' FlashAttention-3 kernels, which are built for sm_90/Hopper only | `export XFORMERS_DISABLED=1` — dinov2 falls back to its plain PyTorch attention/SwiGLU. See `docs/setup-fixes.md` point 20 |
 | `ModuleNotFoundError: No module named 'appdirs'` while building `nvidia-pyindex` | its `setup.py` needs `appdirs` even under `--no-build-isolation` | `pip install appdirs` first |
 | `numpy` silently downgraded/upgraded after installing `moge`/`utils3d` | those packages were installed without `--no-deps`, pulling their own numpy pin | re-pin per the repair snippet above |
 | `[API] 3D worker exited` right after startup, worker log shows `ModuleNotFoundError: No module named 'omegaconf'` (or `'hydra'`) | `sam-3d-objects/notebook/inference.py` imports both `omegaconf` and `hydra` directly; re-registering `sam3d_objects` via `-e '.' --no-deps` (repair path) skips them | `pip install omegaconf hydra-core` — `setup.sh` now installs both explicitly too, so a fresh setup shouldn't hit this |
@@ -179,25 +262,89 @@ Also worth knowing: **`miniconda` (`/root/miniconda3`) lives on the container di
 
 ## Backup
 
-Once the env is verified working, back it up so a future repair session doesn't need to repeat any of the above:
+Only one artifact is genuinely irreplaceable:
+
+| Artifact | How it comes back |
+|---|---|
+| this repo | `git clone` |
+| `sam-3d-objects` source tree | `git clone` (done by `setup.sh` step 1) |
+| checkpoints, ~13 GB | `huggingface-cli download` |
+| **the conda env** | `setup.sh` — 25 min *plus* re-deriving every pin and workaround in `docs/setup-fixes.md` |
+
+So the thing to back up is `/workspace/env-snapshot.tzst` (~4.6 GB) — the same snapshot the daily start already restores from.
+
+**Create it** once the env is verified working (a `/generate-3d` call returned `completed`), from the local mirror rather than the volume — reading 150k files off MooseFS is what made the old copy take 74 minutes:
 
 ```bash
-tar czvf /workspace/sam3d-backup-$(date +%d_%m).tar.gz \
-    -C / workspace/envs/sam3d-objects workspace/sam3d-api
+printf '*.a\n./include\n./share/doc\n./share/man\n./pkgs\n' > /root/snap-exclude.txt
+tar -C /root/sam3d-env-local -X /root/snap-exclude.txt -cf - . | zstd -T0 -3 -o /workspace/env-snapshot.tzst
 ```
 
-**What's in the archive:**
+Takes ~17s (12.7 GiB → 4.6 GiB). Verify before relying on it:
 
-- `workspace/envs/sam3d-objects` — the complete conda env: Python interpreter + every installed package (torch, kaolin, pytorch3d, nvdiffrast, flash-attn, xformers, sam3d_objects and all transitive deps) exactly as verified working
-- `workspace/sam3d-api` — this repo as checked out on the pod, including `sam-3d-objects/checkpoints/hf` (the ~13.3 GB model checkpoints)
+```bash
+zstd -dc /workspace/env-snapshot.tzst | tar -tf - | grep -c "site-packages/torch/"   # expect ~13500
+```
 
-**Not included:** `/root/miniconda3` (the conda installer itself — container disk, cheap to reinstall via `resume.sh`) and `/workspace/pip-cache` (throwaway download cache).
+It lives on the network volume, which survives Stop and Terminate but not a lost or replaced volume, so put a copy elsewhere.
 
-**What it's for:** restoring a working env in minutes instead of re-running `setup.sh` (which means redoing every version pin/workaround in this README) — extract the two paths back under `/workspace` on a fresh pod of the **same GPU architecture** and skip straight to [Daily start](#daily-start-after-a-pod-stoprestart).
+**Private HF repo** (fast to push and pull). Needs a **write** token — the one used for the checkpoint download is read-only and `create_repo` returns `403 Forbidden`. `<user>` is the Hugging Face account name, not the shell user (`root` is not a valid namespace):
 
-Then copy it **off the volume** (RunPod egress is free) — a backup that lives only on the same volume doesn't protect against a volume-level problem.
+```bash
+export HF_HOME=/workspace/hf-home HF_HUB_ENABLE_HF_TRANSFER=1
+/root/sam3d-env-local/bin/python -m huggingface_hub.commands.huggingface_cli whoami   # -> <user>
+/root/sam3d-env-local/bin/python -m huggingface_hub.commands.huggingface_cli upload --private --repo-type=model <user>/sam3d-env-sm120 /workspace/env-snapshot.tzst env-snapshot.tzst
+```
 
-⚠️ The backup is **architecture-bound**: the native extensions (kaolin, pytorch3d, nvdiffrast, flash-attn, xformers) are compiled for the specific GPU's compute capability. Restorable only on the same architecture (e.g. sm_120/Blackwell) — on a different GPU, rebuild via `setup.sh` instead.
+**Plus a copy on your own machine** (RunPod egress is free) — protects against losing the HF account too:
+
+```bash
+runpodctl send /workspace/env-snapshot.tzst
+```
+then `runpodctl receive <code>` locally.
+
+⚠️ **Architecture-bound.** The snapshot contains extensions compiled for one compute capability (`TORCH_CUDA_ARCH_LIST` comes from the detected GPU, see `setup.sh` step 4). sm_120 code does not run on Ampere or Ada — PTX JIT only works forward, never backward. Name the backup after the arch and keep one per GPU type. On a different architecture, run `setup.sh` there and make a second snapshot; the repo itself needs no changes, arch detection is automatic.
+
+---
+
+## Calling the API from your own machine
+
+The API listens on `0.0.0.0:8000` inside the pod. Two ways to reach it from outside:
+
+1. **RunPod HTTP proxy** — add `8000` to the pod's *Expose HTTP Ports*, then use
+   `https://<POD_ID>-8000.proxy.runpod.net`. No SSH tunnel, works from anywhere.
+2. **TCP port mapping** — expose 8000 as a TCP port, RunPod maps it to `<ip>:<external-port>`.
+
+Check it's reachable:
+
+```bash
+curl https://<POD_ID>-8000.proxy.runpod.net/health
+```
+
+⚠️ **The API has no authentication.** Anyone who knows the proxy URL can submit generation
+jobs and use the GPU. Only expose it while you need it, and stop the pod when you're done.
+
+### `client/generate3d.py`
+
+Standard library only — no `pip install` needed. Image in, GLB out:
+
+```bash
+python client/generate3d.py --url https://<POD_ID>-8000.proxy.runpod.net \
+                            --image chair.jpg --x 400 --y 300 --out chair.glb
+```
+
+`--x/--y` is the click point that SAM 2 segments around (pixel coordinates in the source
+image). The script picks the highest-scoring of the returned masks, submits the 3D job,
+polls until it finishes, and downloads the mesh.
+
+Already have a mask? Skip segmentation:
+
+```bash
+python client/generate3d.py --url ... --image chair.jpg --mask chair_mask.png
+```
+
+It uses `/segment`, not `/segment-binary` — the latter returns the masked RGB image rather
+than a binary mask, and dark pixels inside the object would turn into holes.
 
 ---
 

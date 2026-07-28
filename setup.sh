@@ -200,6 +200,13 @@ pip install kaolin==0.18.0 \
 # worker then crashes with ModuleNotFoundError at first job. Explicit installs so neither
 # is ever missing.
 pip install omegaconf hydra-core
+# Weitere Laufzeit-Imports der Pipeline, die weder in requirements.inference.txt stehen noch
+# von '.[dev]' zuverlaessig mitkommen. Ermittelt, indem 'notebook/inference.py' so lange
+# importiert wurde, bis kein ModuleNotFoundError mehr kam — die Paket-Metadaten von
+# sam3d-objects sind als Quelle unbrauchbar, sie listen zusaetzlich den kompletten
+# Trainings-/Dev-Stack (wandb, tensorboard, jupyter, sagemaker, bpy, ...).
+# Ohne diese Zeile stirbt der Worker erst beim ersten /generate-3d, nicht beim Setup.
+pip install loguru timm open3d optree astor easydict lightning xatlas pyvista pymeshfix igraph imageio
 
 echo "--- 5b. cu128 overrides ---"
 pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 \
@@ -310,8 +317,11 @@ echo "--- 11. Verification ---"
 # Import every ABI-sensitive package plus sam3d_objects. A broken torch pin or a wrong-torch
 # build surfaces here as an ImportError / "undefined symbol" instead of failing silently at
 # API start. Non-fatal (set -e is off) — it reports, it does not abort.
+export LIDRA_SKIP_INIT=true
+export XFORMERS_IGNORE_FLASH_VERSION_CHECK=1
+export XFORMERS_DISABLED=1
 python - <<'PYEOF'
-import importlib, sys
+import importlib, sys, os
 checks = ["torch", "numpy", "kaolin", "pytorch3d", "nvdiffrast",
           "flash_attn", "xformers.ops", "sam3d_objects"]
 failed = []
@@ -325,6 +335,21 @@ for m in checks:
     except Exception as e:
         print(f"  FAIL {m}: {type(e).__name__}: {e}")
         failed.append(m)
+# 'import sam3d_objects' allein reicht nicht: die Pipeline-Module, die der Worker laedt,
+# haengen an weiteren Paketen (loguru, timm, open3d, ...). Fehlt eines, faellt das sonst
+# erst beim ersten /generate-3d auf. notebook/inference.py ist genau der Pfad, den
+# worker_3d.py:132 nimmt.
+nb = next((p for p in ("sam-3d-objects/notebook", "notebook") if os.path.isdir(p)), None)
+if nb:
+    sys.path.insert(0, os.path.abspath(nb))
+    try:
+        from inference import Inference          # noqa: F401
+        print("  OK   notebook/inference.py (voller Worker-Importpfad)")
+    except Exception as e:
+        print(f"  FAIL notebook/inference.py: {type(e).__name__}: {e}")
+        failed.append("inference")
+else:
+    print("  SKIP notebook/inference.py — Verzeichnis nicht gefunden")
 print("=== VERIFICATION PASSED ===" if not failed
       else f"=== VERIFICATION FAILED: {failed} ===")
 sys.exit(1 if failed else 0)

@@ -22,8 +22,10 @@ Download, native Builds und Inferenz-Laufzeit.
 | 2 | `--max-workers 1 → 4` | Checkpoint-Download (Step 6) | ⏳ |
 | 3 | `MAX_JOBS` dynamisch am RAM | Native Builds (Step 9) | ⏳ |
 | 4 | conda-Paket-Cache auf lokale NVMe | Setup (conda create) | ⏳ |
-| 5 | Checkpoints auf lokale NVMe kopieren | Inferenz / Worker-Start | ✅ |
+| 5 | ~~Checkpoints auf lokale NVMe kopieren~~ | Worker-Start | ❌ zurückgenommen |
 | 6 | Persistent Worker (Pipeline einmal laden) | Inferenz pro Request | ✅ |
+| 7 | Env-Mirror per Tar-Snapshot statt `cp -a` | Pod-Start | ✅ 74m42s → 22,5s |
+| 8 | `TORCH_HOME` aufs Volume (moge/dinov2-Cache) | Pod-Start | ⏳ |
 
 ---
 
@@ -124,8 +126,12 @@ export SAM3D_CHECKPOINT_DIR="$LOCAL_CKPT"
 **Warum:** der Worker lädt die Pipeline von schneller lokaler NVMe statt vom langsameren
 MooseFS-Volume. Einmalige Kopierzeit pro Pod gegen schnelleren Worker-Start.
 
-**Voraussetzung:** Container Disk ≥40 GB (13,3 GB Checkpoints + Miniconda), siehe
-[`setup.md`](setup.md) Abschnitt 1.3.
+**Zurückgenommen am 28.07.2026.** Gemessen: Pipeline-Load direkt vom Volume 80,9 s bei
+~300 MB/s. Die Kopie kostet allein ≥45 s, lädt danach immer noch und belegt 13 GB von
+40 GB Container-Disk, auf der schon der Env-Mirror liegt. Da der Load dank Persistent
+Worker nur einmal pro Pod anfällt, lohnt der Umweg nicht. `SAM3D_CHECKPOINT_DIR` zeigt
+jetzt direkt aufs Volume. Details in [`env-snapshot-plan.md`](env-snapshot-plan.md)
+Abschnitt 4.
 
 ---
 
@@ -145,6 +151,53 @@ parallele Inferenz). Details und Verifikation in [`worker-test.md`](worker-test.
 
 ---
 
+## 7. Env-Mirror per Tar-Snapshot statt `cp -a`
+
+**Datei:** `install_conda_start_env_host_api.sh`
+
+Der Mirror wird aus `/workspace/env-snapshot.tzst` entpackt statt Datei für Datei kopiert.
+
+| | |
+|---|---|
+| alt: `cp -a`, ~150k Dateien über MooseFS | **74m42s** |
+| neu: Snapshot entpacken (4,62 GiB → 12,7 GiB) | **22,5 s** |
+| Snapshot erstellen (einmalig, vom lokalen Mirror) | 16,5 s |
+
+`cp -a` zahlt pro Datei einen FUSE-Roundtrip. Bandbreite war nie der Engpass, Latenz schon.
+
+Vollständige Begründung, Runbook und Snapshot-Wartung in
+[`env-snapshot-plan.md`](env-snapshot-plan.md).
+
+---
+
+## 8. Model-Caches aufs Volume
+
+**Datei:** `install_conda_start_env_host_api.sh`
+
+Der Pipeline-Load zieht zwei Gewichte nach, über **zwei verschiedene** Mechanismen:
+
+| Modell | Größe | Cache-Variable | Default (Container-Disk) |
+|---|---|---|---|
+| moge | 1,26 GB | `HF_HOME` (huggingface_hub) | `~/.cache/huggingface` |
+| dinov2 | 1,13 GB | `TORCH_HOME` (torch.hub) | `~/.cache/torch` |
+
+Beide Defaults liegen auf der Container-Disk → nach jedem Pod-Stop weg, jedes Mal neu aus
+dem Netz (~14 s zusammen, plus Abhängigkeit davon, dass die Quellen erreichbar sind).
+
+```bash
+export TORCH_HOME=/workspace/torch-cache
+export HF_HOME=/workspace/hf-home
+```
+
+Am Fortschrittsbalken unterscheidbar: `model.pt: 100%|...` (Dateiname vorangestellt) ist
+huggingface_hub, `Downloading: "https://..."` ist torch.hub. Nur `TORCH_HOME` zu setzen
+lässt moge weiter bei jedem Start laden — genau das war zuerst der Fall.
+
+`HF_HOME` hält zusätzlich den HF-Token persistent, der sonst ebenfalls bei jedem Pod-Stop
+verloren geht.
+
+---
+
 ## Hinweise
 
 - Hebel 1–3 wirken v.a. beim **ersten** Lauf auf einem frischen Volume. Nach einem
@@ -152,3 +205,5 @@ parallele Inferenz). Details und Verifikation in [`worker-test.md`](worker-test.
   Re-Runs auf demselben Volume überspringen Download und Build-Downloads ohnehin.
 - Hebel 1–3 sind noch **ungetestet** — beim ersten Lauf mit der neuen Fassung auf die
   beiden Echo-Zeilen (hf_transfer-Geschwindigkeit in Step 6, `MAX_JOBS` in Step 9) achten.
+- Hebel 5 (Env-Mirror + Checkpoint-Copy) kostet aktuell ~2 h pro Pod-Start. Ersatz durch
+  einen Tar-Snapshot ist geplant → [`env-snapshot-plan.md`](env-snapshot-plan.md).
