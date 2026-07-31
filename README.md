@@ -256,6 +256,15 @@ These are already handled by `install_conda_start_env_host_api.sh` (and `LIDRA_S
 | `numpy` silently downgraded/upgraded after installing `moge`/`utils3d` | those packages were installed without `--no-deps`, pulling their own numpy pin | re-pin per the repair snippet above |
 | `[API] 3D worker exited` right after startup, worker log shows `ModuleNotFoundError: No module named 'omegaconf'` (or `'hydra'`) | `sam-3d-objects/notebook/inference.py` imports both `omegaconf` and `hydra` directly; re-registering `sam3d_objects` via `-e '.' --no-deps` (repair path) skips them | `pip install omegaconf hydra-core` — `setup.sh` now installs both explicitly too, so a fresh setup shouldn't hit this |
 
+One client-side quirk, not covered by the table above: **Cloudflare sits in front of the RunPod
+proxy and answers `403 Forbidden` to requests with the default `Python-urllib/3.x` User-Agent.**
+It looks exactly like the pod being down or the port not being exposed, but `curl` against the
+same URL returns `200` — that mismatch is the tell. Any HTTP client talking to
+`https://<POD_ID>-8000.proxy.runpod.net` must send its own `User-Agent`; `client/generate3d.py`
+sends `sam3d-api-client/1.0` on every request, including the GLB download (which is why it does
+not use `urllib.request.urlretrieve` — that can't set headers). The API itself has no auth, so a
+`403` never originates from it.
+
 Also worth knowing: **`miniconda` (`/root/miniconda3`) lives on the container disk, not the network volume.** It survives a pod **Stop**, but not a **Terminate** — a Terminate needs `resume.sh`/`install_conda_start_env_host_api.sh` to reinstall it (automatic, no data loss — the conda env itself is on `/workspace` and survives).
 
 ---
@@ -326,7 +335,7 @@ jobs and use the GPU. Only expose it while you need it, and stop the pod when yo
 
 ### `client/generate3d.py`
 
-Standard library only — no `pip install` needed. Image in, GLB out:
+Image in, GLB out:
 
 ```bash
 python client/generate3d.py --url https://<POD_ID>-8000.proxy.runpod.net \
@@ -342,6 +351,17 @@ Already have a mask? Skip segmentation:
 ```bash
 python client/generate3d.py --url ... --image chair.jpg --mask chair_mask.png
 ```
+
+Cut-out image with a transparent background? Drop both — the mask comes from the alpha
+channel:
+
+```bash
+python client/generate3d.py --url ... --image chair.png --out chair.glb
+```
+
+Standard library only, except for the alpha-channel path, which needs Pillow
+(`pip install pillow`). An image with no alpha channel and no `--x/--y` is an error — the
+script does not guess a mask.
 
 It uses `/segment`, not `/segment-binary` — the latter returns the masked RGB image rather
 than a binary mask, and dark pixels inside the object would turn into holes.
