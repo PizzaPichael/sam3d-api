@@ -1,0 +1,3 @@
+*.glb
+__pycache__/
+*.pyc
